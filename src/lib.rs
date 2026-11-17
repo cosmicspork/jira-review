@@ -6,9 +6,12 @@
 pub mod args;
 pub mod auth;
 pub mod change;
+pub mod contract;
 pub mod jira;
 pub mod mcp;
 pub mod review;
+#[cfg(unix)]
+pub mod serve;
 pub mod stdio;
 pub mod store;
 pub mod views;
