@@ -1,0 +1,37 @@
+[package]
+name = "jira-review"
+version = "0.1.0"
+license = "MIT"
+edition = "2024"
+description = "Jira from the command line and from agents, where no write is applied without review"
+repository = "https://github.com/cosmicspork/jira-review"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "jira-review"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+dotenvy = "0.15"
+# The default `v1` store is Keychain on macOS and the Secret Service over
+# zbus (pure Rust, `crypto-rust`) on Linux: no libdbus, no OpenSSL.
+keyring = "4"
+pulldown-cmark = { version = "0.13", default-features = false }
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+similar = "2"
+time = { version = "0.3", features = ["formatting"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "io-std", "fs"] }
+uuid = { version = "1", features = ["v4", "v7"] }
+
+[dev-dependencies]
+axum = "0.8"
+tempfile = "3"
+tokio = { version = "1", features = ["process"] }
