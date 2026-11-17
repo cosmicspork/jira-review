@@ -1,7 +1,8 @@
 //! Who jira-review is to Jira: a site and either an email with an API token
 //! (Jira Cloud, HTTP Basic) or a personal access token (Jira Data Center,
 //! Bearer). The same env-style fields serve every source: the process
-//! environment, a `.env` file and the OS keyring.
+//! environment, a `.env` file, the OS keyring, and the credential Tracon
+//! lends a plugin call.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -207,6 +208,15 @@ pub fn keyring_delete(profile: &str) -> Result<bool, String> {
         Ok(()) => Ok(true),
         Err(keyring::Error::NoEntry) => Ok(false),
         Err(e) => Err(e.to_string()),
+    }
+}
+
+/// The name a plugin call's credential is lent under: `jira` for no
+/// profile, `jira-<profile>` otherwise.
+pub fn lent_name(profile: Option<&str>) -> String {
+    match profile {
+        None => "jira".into(),
+        Some(p) => format!("jira-{p}"),
     }
 }
 

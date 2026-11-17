@@ -172,6 +172,13 @@ enum Command {
     },
     /// Serve MCP on stdin and stdout for any agent client.
     Mcp,
+    /// Serve the Tracon plugin contract on a Unix socket.
+    Serve {
+        #[arg(long)]
+        socket: PathBuf,
+        #[arg(long)]
+        data: PathBuf,
+    },
     /// Convert between Jira wiki markup and Markdown.
     Wiki {
         #[command(subcommand)]
@@ -607,6 +614,15 @@ async fn run(cli: Cli) -> Result<(), Fail> {
             stdio::run(Arc::new(host))
                 .await
                 .map_err(|e| format!("stdio: {e}"))?;
+        }
+        Command::Serve { socket, data } => {
+            #[cfg(unix)]
+            jira_review::serve::run(socket, data).await?;
+            #[cfg(not(unix))]
+            return Err(Fail(
+                1,
+                format!("serve needs Unix sockets ({socket:?}, {data:?})"),
+            ));
         }
         Command::Wiki { direction } => match direction {
             WikiDirection::ToMarkdown { file } => {

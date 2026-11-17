@@ -66,6 +66,12 @@ impl Store {
         self.write(Place::Pending, p)
     }
 
+    /// Record a proposal that was decided without waiting, as `serve` does
+    /// once the node approved it.
+    pub fn record(&self, p: &Proposal) -> Result<(), String> {
+        self.write(Place::Decided, p)
+    }
+
     /// The proposals waiting on a reviewer, oldest first. Ids start with a
     /// v7 UUID, so their order is the order they were proposed in.
     pub fn pending(&self) -> Result<Vec<Proposal>, String> {

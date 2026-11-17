@@ -2,12 +2,11 @@
 
 Jira from the command line and from agents, where **no write is applied without review**. Reads answer directly. A write (`update`, `transition`, `link`, `create`, `comment`) is first *proposed* as a change file that holds the issue's current fields, the proposed fields, and the issue's `updated` stamp. `show` renders it as a diff, and `apply` sends it only if the issue hasn't moved since.
 
-It has two modes:
+One binary, three modes:
 
 - **a CLI** for people and scripts. A change file is plain JSON, so it can be reviewed in git like any other diff;
-- **`jira-review mcp`**, an MCP server on stdio for any agent client. Reads answer directly. Writes return a proposal id the agent waits on while a person runs `jira-review review`.
-
-A third mode, `jira-review serve`, is coming in a follow-up change. It implements the [Tracon](https://github.com/cosmicspork/tracon) plugin contract, in which the node's approval card is the review step.
+- **`jira-review mcp`**, an MCP server on stdio for any agent client. Reads answer directly. Writes return a proposal id the agent waits on while a person runs `jira-review review`;
+- **`jira-review serve`**, the [Tracon](https://github.com/cosmicspork/tracon) plugin contract v1. The node's approval card is the review step.
 
 Other Jira tools apply writes immediately. Atlassian's ACLI is Cloud only, closed source, and cannot list an issue's available transitions. [jira-cli](https://github.com/ankitpokhrel/jira-cli) is interactive. Atlassian's hosted Rovo MCP server and [mcp-atlassian](https://github.com/sooperset/mcp-atlassian) apply whatever the agent asks. jira-review puts a reviewable, stale-checked change between the request and Jira.
 
@@ -15,11 +14,13 @@ It talks to Jira's REST API v2 with wiki markup (no ADF), which both Jira Cloud 
 
 ## Install
 
+Download the archive for your platform from the [releases](https://github.com/cosmicspork/jira-review/releases) (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`) and check it against `checksums.txt`. The binary is `bin/jira-review`. It is built with rustls and pure-Rust dependencies: no OpenSSL, no libdbus, no host libraries beyond the C runtime.
+
+Or build it yourself:
+
 ```sh
 cargo install --git https://github.com/cosmicspork/jira-review
 ```
-
-It is built with rustls and pure-Rust dependencies: no OpenSSL, no libdbus, no host libraries beyond the C runtime. Prebuilt release archives will come with the Tracon plugin change.
 
 ## Configuration
 
@@ -110,13 +111,57 @@ jira-review review --reject <id> --reason 'not this sprint'
 
 Approving applies the change at once with the reviewer's own credential, running the stale check at that moment. Proposals live in `$JIRA_REVIEW_STATE`, else `$XDG_STATE_HOME/jira-review`, else `~/.local/state/jira-review` (`~/Library/Application Support/jira-review` on macOS), as `pending/<id>.json` and then `decided/<id>.json`. Claiming one is an atomic rename, so two reviewers can't both apply it.
 
-## The `tracon/preview` seam
+## Tracon plugin (`jira-review serve`)
 
-`change::propose` only reads: its proposal is what a Tracon `tracon/preview` would answer, and its `versions` are the version token. `change::apply(…, expected)` checks a token handed back with an approved call. The plugin mode that uses them comes in a follow-up change.
+`jira-review serve --socket <path> --data <dir>` implements the Tracon plugin contract v1: MCP over HTTP on the Unix socket the node names (POST answers with JSON, GET gets 405). The manifest is [`tracon-plugin.toml`](tracon-plugin.toml):
+
+- credential `jira`, pattern `jira-*`. A tool's optional `profile` argument picks `jira-<profile>` instead of `jira`. Credentials are lent per call in the caller context, never read from the start environment, so a credential missing from a call means the call can't use it;
+- tools `search`, `issue`, `transitions` (read) and `update`, `transition`, `link`, `create`, `comment` (write; `transition` is `consequential`);
+- `egress = ["*.atlassian.net:443"]`. A Data Center host is whatever `JIRA_URL` names. The node shows egress on cards and does not enforce it.
+
+At start it requires `TRACON_PLUGIN_TOKEN` and `TRACON_NODE_KEY` (and `TRACON_CONTRACT=1` if set), and exits non-zero without them. `initialize`, `ping` and `tools/list` need no caller context. Every `tools/call` must carry a verified context. A write runs only when its context carries an `approval_id`, because the node's approval card is the review. It then proposes and applies in one step and records the change under `<data>/proposals/decided/`.
+
+The seam for `tracon/preview` is `change::propose`, whose proposal is the preview and whose `versions` are the version token, and `change::apply(…, expected)`, which checks a token handed back. Until the node sends that token, an approved write in `serve` is checked against the issue as it is when the call arrives, so standalone mode is the only one that enforces staleness today.
+
+### Caller context: wire format v1 (provisional, shared with sql-review and Tracon U3)
+
+On each `tools/call`, `params._meta.tracon` is:
+
+```json
+{
+  "v": 1,
+  "plugin": "jira-review",
+  "instance": "<lowercase hex sha256 of TRACON_PLUGIN_TOKEN>",
+  "tool": "<tool name, unprefixed>",
+  "arguments_sha256": "<lowercase hex sha256 of the canonical JSON of params.arguments>",
+  "caller": { "kind": "operator" | "agent" | "plugin", "session": "<id or null>", "harness": "<id or null>" },
+  "channel": "<channel>",
+  "approval_id": "<id>" | null,
+  "issued_ms": 0,
+  "expires_ms": 0,
+  "nonce": "<32 lowercase hex chars>",
+  "credentials": { "<credential name>": { "<FIELD>": "<value>" } },
+  "signature": "<lowercase hex ed25519 signature>"
+}
+```
+
+- **Signed bytes:** the ASCII label `tracon/v1/plugin-call`, then a big-endian u32 length and the canonical JSON of the object without `signature`. The signature is ed25519 by the node key, whose public key `TRACON_NODE_KEY` carries as lowercase hex.
+- **Canonical JSON** (Tracon's `proto::admin::write_canonical`): object keys sorted by byte order, no whitespace, strings and keys escaped as `serde_json` escapes them, `null` written out. The context holds integers only, and a float in it is refused. A missing `arguments` hashes as `{}`.
+- **Checks, in order**, any failure refusing the call with JSON-RPC error `-32001` (`data.check` names it) before anything is read or sent:
+  1. `v` is 1 and `plugin` is `jira-review`;
+  2. `instance` matches;
+  3. `tool` and `arguments_sha256` match the call;
+  4. the signature verifies;
+  5. `issued_ms − 5 s ≤ now ≤ expires_ms + 5 s`, and the window is at most 60 s;
+  6. the nonce hasn't been seen;
+  7. a write carries an `approval_id`.
+- `caller.kind = "plugin"` is reserved: it is accepted, but nothing sends it yet.
+
+[`tests/contract_vectors.json`](tests/contract_vectors.json) pins every byte: a fixed key, token and clock, a valid call with its signing bytes and signature, and one tampered case per check. Its `seed` is the **raw ed25519 secret key** (`SigningKey::from_bytes`), *not* a Tracon `Identity` seed, which derives its key through HKDF. sql-review should copy the file into its tests, and Tracon's plugin host should check its signer against it. `cargo test --test contract -- --ignored generate_contract_vectors` regenerates it deterministically.
 
 ## The `jira_wiki` format
 
-This crate **owns the `jira_wiki` format**, conversion between Jira wiki markup and Markdown in both directions. A later change will declare it in the Tracon plugin manifest (and serve `tracon/format/convert`). Both directions are library functions and CLI subcommands:
+This crate **owns the `jira_wiki` format**, conversion between Jira wiki markup and Markdown in both directions. A later unit will declare it in the manifest (and serve `tracon/format/convert`). Both directions are library functions and CLI subcommands:
 
 ```sh
 jira-review wiki to-markdown description.txt
@@ -144,13 +189,17 @@ jira-review wiki from-markdown notes.md
 - both auth schemes' headers;
 - credential precedence (environment, then `.env`, then keyring);
 - `mcp` over stdio with the proposal flow across processes (approve, reject, stale);
-- the CLI's change files: propose, show, apply once, and a stale apply exiting 3.
+- `serve` over a Unix socket with signed contexts, each refusal and an approved write;
+- the manifest against `tools/list`;
+- the contract vectors.
 
 **Not verified:**
 
 - a live Jira Cloud site. `tests/live.rs` is a read-only smoke test, run with `JIRA_LIVE=1 cargo test --test live -- --ignored`;
 - **Jira Data Center (bearer PAT): unverified** on a real instance;
-- the keyring backends (`login`, `logout`, keyring reads). Only the secret format is tested.
+- the keyring backends (`login`, `logout`, keyring reads). Only the secret format is tested;
+- the release workflow, until the first tag, including the aarch64 Linux cross build;
+- the caller-context format, which stays provisional until Tracon's plugin host (U3) signs against the vectors.
 
 ## Development
 

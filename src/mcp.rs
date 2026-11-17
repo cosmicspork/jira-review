@@ -1,15 +1,19 @@
 //! A small MCP server: JSON-RPC 2.0 with `initialize`, `ping`, `tools/list`
-//! and `tools/call`, independent of transport; `stdio` carries it as lines
-//! for any MCP client. What a tool call does is the [`Host`]'s:
-//! `Standalone` proposes writes for a person to review.
+//! and `tools/call`, independent of transport. `stdio` carries it as lines
+//! for any MCP client; `serve` carries it over HTTP on a Unix socket for
+//! Tracon. What a tool call does is the [`Host`]'s: `Standalone` proposes
+//! writes for a person to review, `Plugin` applies them only with the
+//! node's approval.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::auth::Credential;
-use crate::change::{self, Kind, Render};
+use crate::auth::{self, Credential};
+use crate::change::{self, Kind, Outcome, Render};
+use crate::contract::{self, CallId, ContractEnv, NonceCache};
 use crate::jira::Jira;
 use crate::store::{Place, Store};
 
@@ -134,8 +138,9 @@ fn strings(description: &str) -> Value {
     json!({ "type": "array", "items": { "type": "string" }, "description": description })
 }
 
-/// The eight tools, as `tools/list` serves them.
-pub fn definitions(write_note: &str) -> Vec<Value> {
+/// The eight tools, as `tools/list` serves them. `profile` adds the argument
+/// that picks which lent credential a plugin call uses.
+pub fn definitions(profile: bool, write_note: &str) -> Vec<Value> {
     let key = string("Issue key, e.g. WRK-123.");
     let issue_fields = json!({
         "project": string("Project key, e.g. WRK."),
@@ -165,7 +170,7 @@ pub fn definitions(write_note: &str) -> Vec<Value> {
         json!({ "readOnlyHint": false, "destructiveHint": destructive,
                 "idempotentHint": false, "openWorldHint": true })
     };
-    vec![
+    let mut tools = vec![
         json!({
             "name": "search",
             "description": "Search Jira issues with JQL. One row per issue: key, type, summary, \
@@ -267,7 +272,14 @@ pub fn definitions(write_note: &str) -> Vec<Value> {
             }, "required": ["key", "body"] },
             "annotations": write(false),
         }),
-    ]
+    ];
+    if profile {
+        for tool in &mut tools {
+            tool["inputSchema"]["properties"]["profile"] =
+                string("Which lent Jira credential to use: none for jira, P for jira-P.");
+        }
+    }
+    tools
 }
 
 /// A read tool's answer.
@@ -354,7 +366,7 @@ impl Standalone {
 
 impl Host for Standalone {
     fn tools(&self) -> Vec<Value> {
-        let mut tools = definitions(STANDALONE_WRITE);
+        let mut tools = definitions(false, STANDALONE_WRITE);
         tools.push(json!({
             "name": "proposal_status",
             "description": format!(
@@ -411,5 +423,107 @@ impl Host for Standalone {
             Ok(v) => tool_ok(&v),
             Err(e) => tool_error(&e),
         })
+    }
+}
+
+/// `jira-review serve`: every call verified against the node's signed
+/// caller context, its credential lent with it, and a write applied only
+/// with the node's approval.
+pub struct Plugin {
+    pub env: ContractEnv,
+    pub nonces: NonceCache,
+    pub store: Store,
+}
+
+const PLUGIN_WRITE: &str = "Applied only once the operator has approved this call.";
+
+/// Code for a call refused by its caller context.
+pub const REFUSED: i64 = -32001;
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
+impl Plugin {
+    async fn run(
+        &self,
+        name: &str,
+        args: &Value,
+        lent: &HashMap<String, HashMap<String, String>>,
+    ) -> Result<Value, String> {
+        let mut args = args.clone();
+        let profile = match args.as_object_mut().and_then(|o| o.remove("profile")) {
+            None | Some(Value::Null) => None,
+            Some(Value::String(p)) if !p.trim().is_empty() => Some(p.trim().to_string()),
+            Some(_) => return Err("profile expects a non-empty string".into()),
+        };
+        let wanted = auth::lent_name(profile.as_deref());
+        let fields = lent
+            .get(&wanted)
+            .ok_or_else(|| format!("credential {wanted} was not lent to this call"))?;
+        let jira = Jira::new(Credential::from_map(
+            fields,
+            &format!("credential {wanted}"),
+        )?);
+        let Some(kind) = Kind::parse(name) else {
+            return read(name, &args, &jira).await;
+        };
+        // The node's card was the review: propose and apply in one step.
+        let mut p = change::propose(kind, &args, &jira).await?;
+        // TODO(U6): once `tracon/preview` hands the proposal's `versions` to
+        // the node as its version token, the approved call carries it back
+        // and this becomes `apply(&p, &jira, Some(&token))`, so a change that
+        // moved since the card was shown is refused here too.
+        let applied = change::apply(&p, &jira, None).await;
+        p.outcome = Some(Outcome::of(applied.clone()));
+        if let Err(e) = self.store.record(&p) {
+            eprintln!("jira-review: could not record {}: {e}", p.id);
+        }
+        applied
+            .map(|result| json!({ "proposal_id": p.id, "result": result }))
+            .map_err(|e| e.to_string())
+    }
+}
+
+impl Host for Plugin {
+    fn tools(&self) -> Vec<Value> {
+        definitions(true, PLUGIN_WRITE)
+    }
+
+    async fn call(
+        &self,
+        name: &str,
+        arguments: Option<&Value>,
+        meta: Option<&Value>,
+    ) -> Result<Value, RpcError> {
+        if !READS.contains(&name) && !is_write(name) {
+            return Err(unknown(name));
+        }
+        let context = meta.map_or(&Value::Null, |m| &m["tracon"]);
+        let call = CallId {
+            tool: name,
+            arguments,
+            write: is_write(name),
+        };
+        let caller =
+            contract::verify(context, &call, &self.env, now_ms(), &self.nonces).map_err(|r| {
+                RpcError {
+                    code: REFUSED,
+                    message: format!("refused: {}", r.reason),
+                    data: Some(json!({ "check": r.check })),
+                }
+            })?;
+        let empty = json!({});
+        Ok(
+            match self
+                .run(name, arguments.unwrap_or(&empty), &caller.credentials)
+                .await
+            {
+                Ok(v) => tool_ok(&v),
+                Err(e) => tool_error(&e),
+            },
+        )
     }
 }

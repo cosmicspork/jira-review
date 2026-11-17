@@ -1,0 +1,47 @@
+name = "jira-review"
+version = "0.1.0"
+contract = 1
+exec = ["bin/jira-review", "serve"]
+# A Jira Cloud site; a Data Center host is whatever JIRA_URL names. Shown on
+# cards, not enforced.
+egress = ["*.atlassian.net:443"]
+
+# Lent per call as `jira`, or `jira-<profile>` for a tool call's `profile`.
+# Fields: JIRA_URL with JIRA_EMAIL and JIRA_TOKEN (Cloud), or JIRA_PAT (Data
+# Center). The same credential serves reads and approved writes.
+[[credential]]
+name = "jira"
+pattern = "jira-*"
+
+[[tool]]
+name = "search"
+hint = "read"
+
+[[tool]]
+name = "issue"
+hint = "read"
+
+[[tool]]
+name = "transitions"
+hint = "read"
+
+[[tool]]
+name = "update"
+hint = "write"
+
+[[tool]]
+name = "transition"
+hint = "write"
+consequential = true
+
+[[tool]]
+name = "link"
+hint = "write"
+
+[[tool]]
+name = "create"
+hint = "write"
+
+[[tool]]
+name = "comment"
+hint = "write"
