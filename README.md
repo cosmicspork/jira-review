@@ -53,10 +53,13 @@ jira-review transitions WRK-12 --format table
 # Writes: each only proposes, writing ./<id>.json and printing the diff
 jira-review update WRK-12 --summary 'Port the feed' --add-label etl --remove-label stale
 jira-review update WRK-12 --description-file notes.md --markdown
+jira-review update WRK-12 --assignee ada@example.com --due 2026-12-01
+jira-review update WRK-12 --unassign --clear-due
 jira-review transition WRK-12 'In Review'
 jira-review transition WRK-12 Resolve --field 'resolution={"name":"Fixed"}'
 jira-review link WRK-1 Blocks WRK-2
-jira-review create --project WRK --type Task --summary 'Write the importer' --parent WRK-10
+jira-review create --project WRK --type Task --summary 'Write the importer' --parent WRK-10 \
+  --assignee me --due 2026-12-15
 jira-review create --file issues.json        # {"issues": [...]} or a list; parents may be "#N"
 jira-review comment WRK-12 --body-file reply.md --markdown
 
@@ -80,15 +83,16 @@ jira-review apply 0193…-update-WRK-12.json
   "created": "2026-11-17T10:00:00Z",
   "args": { "key": "WRK-12", "summary": "Port the feed", "add_labels": ["etl"] },
   "versions": { "WRK-12": "2026-11-16T09:12:33.000+0000" },
-  "current": { "summary": "Port it", "description": "…", "priority": "Medium", "labels": ["stale"], "parent": null },
-  "proposed": { "summary": "Port the feed", "description": "…", "priority": "Medium", "labels": ["stale", "etl"], "parent": null }
+  "current": { "summary": "Port it", "description": "…", "priority": "Medium", "assignee": null, "assignee_ref": null, "duedate": null, "labels": ["stale"], "parent": null },
+  "proposed": { "summary": "Port the feed", "description": "…", "priority": "Medium", "assignee": null, "assignee_ref": null, "duedate": null, "labels": ["stale", "etl"], "parent": null }
 }
 ```
 
 - `args` are the write's arguments. `apply` validates them again and builds the request from them.
 - `versions` lists every existing issue the change depends on, with its `updated` stamp at propose time. `update`, `transition` and `comment` depend on their issue, and `link` depends on both of its issues. `create` depends on nothing, so it cannot go stale. A parent named by key is checked to exist at propose time only, and a `#N` parent is an earlier item of the same change.
 - **The stale rule:** `apply` reads each issue's `updated` and refuses if any differs. Jira has no conditional write, so a change that lands between that check and the write is not caught; the window is one request long.
-- Per kind: `update` shows the five fields it can write (summary, description, priority, labels, parent). Label removals are matched to the issue's own spelling, and any the issue doesn't have are listed as `not_on_issue`. `transition` shows the status before and after, with the transition it takes. A name matching no transition or several is refused with the list, and so is a transition whose required fields are missing. `link` shows `from`'s links before and after, in the link type's wording. `create` shows the planned issues (up to 10). `comment` shows the last comment's author and time and the new body.
+- Per kind: `update` shows the seven fields it can write (summary, description, priority, assignee, due date, labels, parent). Label removals are matched to the issue's own spelling, and any the issue doesn't have are listed as `not_on_issue`. `transition` shows the status before and after, with the transition it takes. A name matching no transition or several is refused with the list, and so is a transition whose required fields are missing. `link` shows `from`'s links before and after, in the link type's wording. `create` shows the planned issues (up to 10).
+- **Assignee and due date.** `duedate` is `YYYY-MM-DD`, checked to be a real day, or null to clear it. `assignee` names a user the way a person would: an account id, a username, an email, a display name, or `me` for the credential's own user; null unassigns. Propose finds them among the users the issue (for `create`, the project) can be assigned to, with Jira's `user/assignable/search`: by `query`, then by `accountId`, on Cloud, and by `username` on Data Center. An exact match on id, username, email or display name wins; otherwise a search that finds exactly one user takes them, and one that finds none or several is refused with who it found. The change shows the assignee by display name and keeps the account Jira takes (`{"accountId": …}` on Cloud, `{"name": …}` on Data Center) as `assignee_ref`, which is what `apply` sends. `--assignee`, `--unassign`, `--due` and `--clear-due` are the CLI's spellings. `comment` shows the last comment's author and time and the new body.
 
 ## `jira-review mcp`
 
@@ -184,6 +188,7 @@ jira-review wiki from-markdown notes.md
 
 - each read, including the Data Center search fallback;
 - each write's propose → show → apply, with the exact requests sent;
+- assignee lookup (by email, name, account id and `me`; an ambiguous or unknown name refused) on both Cloud and Data Center, and due dates set and cleared;
 - a stale apply refused after the fake's `updated` moves, with nothing sent;
 - multi-issue create with `#N` parents and a refusal partway through;
 - both auth schemes' headers;
@@ -197,6 +202,7 @@ jira-review wiki from-markdown notes.md
 
 - a live Jira Cloud site. `tests/live.rs` is a read-only smoke test, run with `JIRA_LIVE=1 cargo test --test live -- --ignored`;
 - **Jira Data Center (bearer PAT): unverified** on a real instance;
+- assignee lookup against a real Jira: the fake matches users the way the REST docs describe `user/assignable/search`, and a real site's matching may differ;
 - the keyring backends (`login`, `logout`, keyring reads). Only the secret format is tested;
 - the release workflow, until the first tag, including the aarch64 Linux cross build;
 - the caller-context format, which stays provisional until Tracon's plugin host (U3) signs against the vectors.

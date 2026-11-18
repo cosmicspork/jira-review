@@ -233,24 +233,79 @@ pub async fn propose(kind: Kind, args: &Value, jira: &Jira) -> Result<Proposal, 
 
 type Proposed = (Versions, Value, Value);
 
-const UPDATE_SHOWN: [&str; 5] = ["summary", "description", "priority", "labels", "parent"];
+const UPDATE_SHOWN: [&str; 7] = [
+    "summary",
+    "description",
+    "priority",
+    "assignee",
+    "duedate",
+    "labels",
+    "parent",
+];
 
-/// An update's key, the fields it sets and its label edits.
-type UpdateParts<'a> = (&'a str, Map<String, Value>, Vec<Value>);
+/// An update's key, the fields it sets, its label edits and the assignee it
+/// names.
+type UpdateParts<'a> = (
+    &'a str,
+    Map<String, Value>,
+    Vec<Value>,
+    Option<Option<&'a str>>,
+);
 
-/// The update's fields and its label edits, as `apply` sends them.
+/// The update's fields and its label edits, as `apply` sends them, less the
+/// assignee, which is a user to find and is sent as the account found.
 fn update_parts(args: &Value) -> Result<UpdateParts<'_>, String> {
     let key = args::issue_key(args.get("key"), "key")?;
     let fields = args::fields_from(args, "update", &[])?;
     let edits = args::label_edits(args)?;
-    if fields.is_empty() && edits.is_empty() {
+    let assignee = args::assignee_arg(args)?;
+    if fields.is_empty() && edits.is_empty() && assignee.is_none() {
         return Err(format!(
             "nothing to update: name at least one of {}, {}",
             args::EDITABLE.join(", "),
             args::RELATIVE.join(", ")
         ));
     }
-    Ok((key, fields, edits))
+    Ok((key, fields, edits, assignee))
+}
+
+/// The account a change found for the assignee its arguments name: null to
+/// unassign, else the `assignee_ref` propose put in `found`. A change that
+/// names a user and holds no account for them is not applied.
+fn assignee_ref(asked: Option<&str>, found: &Value) -> Result<Value, String> {
+    let reference = &found["assignee_ref"];
+    match asked {
+        None => Ok(Value::Null),
+        Some(_) if reference.is_object() => Ok(reference.clone()),
+        Some(user) => Err(format!(
+            "the change names assignee {user:?} but holds no account for them; propose again"
+        )),
+    }
+}
+
+/// The fields of an update as `apply` sends them, the assignee's account
+/// included.
+fn update_body(p: &Proposal) -> Result<UpdateParts<'_>, String> {
+    let (key, mut fields, edits, assignee) = update_parts(&p.args)?;
+    if let Some(asked) = assignee {
+        fields.insert("assignee".into(), assignee_ref(asked, &p.proposed)?);
+    }
+    Ok((key, fields, edits, assignee))
+}
+
+/// The issues of a create as `apply` sends them, each named assignee's
+/// account put in its fields from the planned issue at the same index.
+fn create_body(p: &Proposal) -> Result<Vec<NewIssue>, String> {
+    let mut plan = args::create_plan(&p.args)?;
+    for (i, issue) in plan.iter_mut().enumerate() {
+        if let Some(asked) = &issue.assignee {
+            let found = &p.proposed["issues"][i];
+            let reference =
+                assignee_ref(asked.as_deref(), found).map_err(|e| format!("issues[{i}]: {e}"))?;
+            issue.fields.insert("assignee".into(), reference);
+        }
+    }
+    Ok(plan)
 }
 
 fn strings(v: &Value) -> Vec<String> {
@@ -270,7 +325,7 @@ fn version_of(key: &str, raw: &Value) -> Result<(String, String), String> {
 }
 
 async fn propose_update(args: &Value, jira: &Jira) -> Result<Proposed, String> {
-    let (key, fields, edits) = update_parts(args)?;
+    let (key, fields, edits, assignee) = update_parts(args)?;
     let raw = jira.get_issue(key, views::CURRENT_FIELDS).await?;
     let versions = Versions::from([version_of(key, &raw)?]);
     let current = views::current_view(&raw);
@@ -296,6 +351,18 @@ async fn propose_update(args: &Value, jira: &Jira) -> Result<Proposed, String> {
             }
         }
         proposed["labels"] = json!(labels);
+    }
+    match assignee {
+        None => {}
+        Some(None) => {
+            proposed["assignee"] = Value::Null;
+            proposed["assignee_ref"] = Value::Null;
+        }
+        Some(Some(asked)) => {
+            let user = jira.assignee(asked, ("issueKey", key)).await?;
+            proposed["assignee"] = user["name"].clone();
+            proposed["assignee_ref"] = user["ref"].clone();
+        }
     }
     if proposed == current {
         let mut why = format!("nothing would change on {key}");
@@ -476,6 +543,12 @@ fn readable(issue: &NewIssue) -> Value {
     if let Some(p) = f.get("priority") {
         out["priority"] = p["name"].clone();
     }
+    if let Some(a) = &issue.assignee {
+        out["assignee"] = json!(a);
+    }
+    if let Some(d) = f.get("duedate") {
+        out["duedate"] = d.clone();
+    }
     if let Some(l) = f.get("labels") {
         out["labels"] = l.clone();
     }
@@ -503,7 +576,34 @@ async fn propose_create(args: &Value, jira: &Jira) -> Result<Proposed, String> {
             seen.push(key);
         }
     }
-    let issues: Vec<Value> = plan.iter().map(readable).collect();
+    let mut issues: Vec<Value> = plan.iter().map(readable).collect();
+    // Each named assignee is found among who the project can assign, once
+    // per project and name.
+    let mut found: BTreeMap<(String, String), Value> = BTreeMap::new();
+    for (i, issue) in plan.iter().enumerate() {
+        let Some(asked) = issue.assignee.as_ref() else {
+            continue;
+        };
+        let Some(asked) = asked else {
+            issues[i]["assignee_ref"] = Value::Null;
+            continue;
+        };
+        let project = issue.fields["project"]["key"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let at = (project, asked.to_lowercase());
+        if !found.contains_key(&at) {
+            let user = jira
+                .assignee(asked, ("project", &at.0))
+                .await
+                .map_err(|e| format!("issues[{i}]: assignee: {e}"))?;
+            found.insert(at.clone(), user);
+        }
+        let user = &found[&at];
+        issues[i]["assignee"] = user["name"].clone();
+        issues[i]["assignee_ref"] = user["ref"].clone();
+    }
     Ok((Versions::new(), Value::Null, json!({ "issues": issues })))
 }
 
@@ -553,12 +653,12 @@ pub async fn apply(
     // Every check that needs no request runs before the first one.
     let a = &p.args;
     match p.kind {
-        Kind::Update => update_parts(a).map(drop),
+        Kind::Update => update_body(p).map(drop),
         Kind::Transition => args::issue_key(a.get("key"), "key")
             .and_then(|_| args::transition_arg(a))
             .map(drop),
         Kind::Link => args::link_args(a).map(drop),
-        Kind::Create => args::create_plan(a).map(drop),
+        Kind::Create => create_body(p).map(drop),
         Kind::Comment => args::issue_key(a.get("key"), "key")
             .and_then(|_| args::text(a, "body"))
             .map(drop),
@@ -579,7 +679,7 @@ pub async fn apply(
 
     match p.kind {
         Kind::Update => {
-            let (key, fields, edits) = update_parts(a).map_err(Invalid)?;
+            let (key, fields, edits, _) = update_body(p).map_err(Invalid)?;
             let (edits, absent) = args::match_removals(edits, &strings(&p.current["labels"]));
             let mut named: Vec<String> = fields.keys().cloned().collect();
             let mut body = json!({ "fields": fields });
@@ -629,7 +729,7 @@ pub async fn apply(
             views::linked(&views::links(&back["fields"]), from, to, &kind).map_err(Refused)
         }
         Kind::Create => {
-            let plan = args::create_plan(a).map_err(Invalid)?;
+            let plan = create_body(p).map_err(Invalid)?;
             if a.get("issues").is_none() {
                 let only = plan
                     .into_iter()
@@ -792,7 +892,10 @@ pub fn render(p: &Proposal, opts: Render) -> String {
     match p.kind {
         Kind::Update => {
             for field in UPDATE_SHOWN {
-                if cur[field] == new[field] {
+                // Two people may share a name; the account tells them apart.
+                let same_account =
+                    field != "assignee" || cur["assignee_ref"] == new["assignee_ref"];
+                if cur[field] == new[field] && same_account {
                     continue;
                 }
                 out.line(&format!("{field}:"));
@@ -870,8 +973,9 @@ pub fn render(p: &Proposal, opts: Render) -> String {
                     scalar(&issue["type"]),
                     scalar(&issue["summary"])
                 ));
-                for field in ["priority", "labels", "parent"] {
-                    if !issue[field].is_null() {
+                for field in ["priority", "assignee", "duedate", "labels", "parent"] {
+                    // An assignee or due date given as null is shown as none.
+                    if issue.get(field).is_some() {
                         let v = match &issue[field] {
                             Value::Array(a) => a.iter().map(scalar).collect::<Vec<_>>().join(", "),
                             other => scalar(other),

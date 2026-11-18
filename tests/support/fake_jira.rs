@@ -31,6 +31,7 @@ struct Jira {
     refuse_write: Vec<(u16, Value)>,
     clock: u32,
     next_issue: u32,
+    users: Vec<Value>,
 }
 
 impl Jira {
@@ -48,6 +49,30 @@ impl Jira {
         if let Some(i) = self.issues.get_mut(key) {
             i["fields"]["updated"] = json!(stamp);
         }
+    }
+
+    /// A user as this deployment shows one: Cloud by account id, Data Center
+    /// by username and key.
+    fn user(&self, u: &Value) -> Value {
+        if self.data_center {
+            json!({ "name": u["name"], "key": u["name"], "displayName": u["displayName"],
+                    "emailAddress": u["emailAddress"] })
+        } else {
+            json!({ "accountId": u["accountId"], "displayName": u["displayName"],
+                    "emailAddress": u["emailAddress"] })
+        }
+    }
+
+    /// The user an `assignee` field names, as an issue shows it, or null.
+    fn assignee(&self, reference: &Value) -> Value {
+        self.users
+            .iter()
+            .find(|u| {
+                (reference["accountId"].is_string() && u["accountId"] == reference["accountId"])
+                    || (reference["name"].is_string() && u["name"] == reference["name"])
+            })
+            .map(|u| self.user(u))
+            .unwrap_or(Value::Null)
     }
 
     fn summary_of(&self, key: &str) -> Value {
@@ -76,6 +101,7 @@ fn issue(key: &str, summary: &str, kind: &str, labels: &[&str]) -> Value {
             "issuetype": { "name": kind },
             "priority": { "name": "Medium" },
             "assignee": null,
+            "duedate": null,
             "labels": labels,
             "parent": null,
             "issuelinks": [],
@@ -102,6 +128,16 @@ impl Fake {
         jira.issues
             .insert("WRK-10".into(), issue("WRK-10", "The epic", "Epic", &[]));
         jira.next_issue = 11;
+        jira.users = vec![
+            json!({ "accountId": "5b10a2844c20165700ede21g", "name": "ada",
+                    "displayName": "Ada Lovelace", "emailAddress": "ada@example.com" }),
+            json!({ "accountId": "5b10ac8d82e05b22cc7d4ef5", "name": "grace",
+                    "displayName": "Grace Hopper", "emailAddress": "grace@example.com" }),
+            json!({ "accountId": "712020:0e1a6b5c", "name": "gkelly",
+                    "displayName": "Grace Kelly", "emailAddress": "gkelly@example.com" }),
+            json!({ "accountId": "557058:me", "name": "me.user",
+                    "displayName": "Me", "emailAddress": "me@example.com" }),
+        ];
         jira.transitions = vec![
             json!({ "id": "11", "name": "Start", "to": status("In Progress"), "fields": {} }),
             json!({ "id": "31", "name": "Resolve", "to": status("Done"), "fields": {
@@ -148,7 +184,22 @@ impl Fake {
         jira_review::jira::Jira::new(self.credential())
     }
 
-    /// Answer as Data Center does: no v3 search.
+    /// A Data Center credential (a PAT) pointed at the fake.
+    pub fn data_center_client(&self) -> jira_review::jira::Jira {
+        let url = self.url.clone();
+        let cred = jira_review::auth::Credential::from_fields(
+            |k| match k {
+                "JIRA_URL" => Some(url.clone()),
+                "JIRA_PAT" => Some("dc-pat".into()),
+                _ => None,
+            },
+            "fake",
+        )
+        .unwrap();
+        jira_review::jira::Jira::new(cred)
+    }
+
+    /// Answer as Data Center does: no v3 search, users by username.
     pub fn data_center(&self) {
         self.state.lock().unwrap().data_center = true;
     }
@@ -248,12 +299,17 @@ async fn handle(
         },
         ("PUT", ["rest", "api", "2", "issue", key]) => {
             let key = key.to_string();
+            let mut set = body["fields"].as_object().cloned().unwrap_or_default();
+            if let Some(a) = set.get("assignee") {
+                let shown = j.assignee(a);
+                set.insert("assignee".into(), shown);
+            }
             let Some(issue) = j.issues.get_mut(&key) else {
                 return missing(&key);
             };
             let f = &mut issue["fields"];
-            for (k, v) in body["fields"].as_object().into_iter().flatten() {
-                f[k] = v.clone();
+            for (k, v) in set {
+                f[k] = v;
             }
             for edit in body["update"]["labels"].as_array().into_iter().flatten() {
                 let labels = f["labels"].as_array_mut().unwrap();
@@ -282,6 +338,9 @@ async fn handle(
             );
             for (k, v) in f.as_object().into_iter().flatten() {
                 new["fields"][k] = v.clone();
+            }
+            if f.get("assignee").is_some() {
+                new["fields"]["assignee"] = j.assignee(&f["assignee"]);
             }
             j.issues.insert(key.clone(), new);
             answer(201, json!({ "id": "9", "key": key, "self": "x" }))
@@ -332,6 +391,55 @@ async fn handle(
             j.touch(&key);
             answer(204, Value::Null)
         }
+        ("GET", ["rest", "api", "2", "myself"]) => {
+            let me = j.users.iter().find(|u| u["displayName"] == "Me").unwrap();
+            answer(200, j.user(me))
+        }
+        ("GET", ["rest", "api", "2", "user", "assignable", "search"]) => {
+            let param = |name: &str| {
+                query.split('&').find_map(|p| {
+                    let (k, v) = p.split_once('=')?;
+                    (k == name).then(|| decode(v))
+                })
+            };
+            if param("issueKey").is_none() && param("project").is_none() {
+                return answer(400, json!({ "errorMessages": ["issueKey or project"] }));
+            }
+            if let Some(key) = param("issueKey")
+                && !j.issues.contains_key(&key)
+            {
+                return missing(&key);
+            }
+            // Each deployment takes only its own parameter, as Jira does.
+            let (by_name, by_id) = if j.data_center {
+                (param("username"), None)
+            } else {
+                (param("query"), param("accountId"))
+            };
+            let found: Vec<Value> = j
+                .users
+                .iter()
+                .filter(|u| {
+                    if let Some(id) = &by_id {
+                        return u["accountId"] == id.as_str();
+                    }
+                    let Some(q) = by_name.as_ref().map(|q| q.to_lowercase()) else {
+                        return false;
+                    };
+                    // A prefix of the whole or of any word, as Jira's user
+                    // search matches.
+                    let starts = |k: &str| {
+                        let v = u[k].as_str().unwrap_or_default().to_lowercase();
+                        v.starts_with(&q) || v.split(' ').any(|w| w.starts_with(&q))
+                    };
+                    starts("displayName")
+                        || starts("emailAddress")
+                        || (j.data_center && starts("name"))
+                })
+                .map(|u| j.user(u))
+                .collect();
+            answer(200, json!(found))
+        }
         ("GET", ["rest", "api", "2", "issueLinkType"]) => {
             answer(200, json!({ "issueLinkTypes": j.link_types }))
         }
@@ -370,4 +478,24 @@ async fn handle(
             json!({ "errorMessages": [format!("fake has no {method} {path}")] }),
         ),
     }
+}
+
+/// A query value as a form encodes it: `+` for a space, `%XX` for a byte.
+fn decode(v: &str) -> String {
+    let bytes = v.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap();
+                out.push(u8::from_str_radix(hex, 16).unwrap());
+                i += 2;
+            }
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    String::from_utf8(out).unwrap()
 }
