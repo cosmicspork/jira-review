@@ -5,15 +5,16 @@ use serde_json::{Value, json};
 use crate::args::LinkType;
 
 /// What a search row carries: enough to pick an issue, not to read it.
-pub const SEARCH_FIELDS: &str = "summary,status,assignee,priority,issuetype,parent,labels";
+pub const SEARCH_FIELDS: &str = "summary,status,assignee,duedate,priority,issuetype,parent,labels";
 
 /// What `issue` reads: enough to write to the issue safely, since a label
 /// list, a parent or a link is what a write would otherwise have to guess.
-pub const ISSUE_FIELDS: &str = "summary,status,assignee,description,comment,issuetype,priority,\
-                                labels,parent,issuelinks,subtasks,created,updated";
+pub const ISSUE_FIELDS: &str = "summary,status,assignee,duedate,description,comment,issuetype,\
+                                priority,labels,parent,issuelinks,subtasks,created,updated";
 
 /// What an `update` is shown against.
-pub const CURRENT_FIELDS: &str = "summary,description,priority,labels,parent,updated";
+pub const CURRENT_FIELDS: &str =
+    "summary,description,priority,assignee,duedate,labels,parent,updated";
 
 /// One `search` row.
 pub fn search_row(i: &Value) -> Value {
@@ -25,6 +26,7 @@ pub fn search_row(i: &Value) -> Value {
         "status": f["status"]["name"],
         "priority": f["priority"]["name"],
         "assignee": f["assignee"]["displayName"],
+        "duedate": f["duedate"],
         "parent": f["parent"]["key"],
         "labels": labels(f),
     })
@@ -71,6 +73,7 @@ pub fn issue_view(v: &Value) -> Value {
         "status": f["status"]["name"],
         "priority": f["priority"]["name"],
         "assignee": f["assignee"]["displayName"],
+        "duedate": f["duedate"],
         "labels": labels(f),
         "parent": if p.is_object() {
             json!({ "key": p["key"], "summary": p["fields"]["summary"] })
@@ -87,16 +90,79 @@ pub fn issue_view(v: &Value) -> Value {
 }
 
 /// The fields `update` writes, as the issue has them now, each in the shape
-/// `update` takes it, so a change compares like with like.
+/// `update` takes it, so a change compares like with like. The assignee is
+/// shown by name, and `assignee_ref` is the account Jira takes, so that two
+/// people with one name still compare as different.
 pub fn current_view(v: &Value) -> Value {
     let f = &v["fields"];
     json!({
         "summary": f["summary"],
         "description": f["description"],
         "priority": f["priority"]["name"],
+        "assignee": f["assignee"]["displayName"],
+        "assignee_ref": user_ref(&f["assignee"]).unwrap_or(Value::Null),
+        "duedate": f["duedate"],
         "labels": labels(f),
         "parent": f["parent"]["key"],
     })
+}
+
+/// How Jira takes a user in a write: Cloud by `accountId`, Data Center by
+/// `name`. `None` for anything that is not a user.
+pub fn user_ref(user: &Value) -> Option<Value> {
+    if let Some(id) = user["accountId"].as_str() {
+        return Some(json!({ "accountId": id }));
+    }
+    user["name"].as_str().map(|n| json!({ "name": n }))
+}
+
+/// A user as a reviewer tells them apart: the name and whatever else Jira
+/// shows of them.
+pub fn describe_user(user: &Value) -> String {
+    let name = user["displayName"].as_str().unwrap_or("?");
+    let id = ["emailAddress", "name", "accountId"]
+        .into_iter()
+        .find_map(|k| user[k].as_str().filter(|s| !s.is_empty()));
+    match id {
+        Some(id) => format!("{name} ({id})"),
+        None => name.to_string(),
+    }
+}
+
+/// The one user of `users` that `asked` names: the one it matches exactly
+/// (account id, username, key, email or display name, ignoring case), or the
+/// only one Jira found. Anything else is refused with who was found, so the
+/// caller can name one exactly.
+pub fn pick_user<'a>(users: &'a [Value], asked: &str, scope: &str) -> Result<&'a Value, String> {
+    let exact: Vec<&Value> = users
+        .iter()
+        .filter(|u| {
+            ["accountId", "name", "key", "emailAddress", "displayName"]
+                .into_iter()
+                .filter_map(|k| u[k].as_str())
+                .any(|v| v.eq_ignore_ascii_case(asked))
+        })
+        .collect();
+    let found: Vec<&Value> = match (exact.as_slice(), users) {
+        ([one], _) => return Ok(one),
+        ([], [one]) => return Ok(one),
+        ([], _) => users.iter().collect(),
+        (some, _) => some.to_vec(),
+    };
+    if found.is_empty() {
+        return Err(format!("no user {scope} matches {asked:?}"));
+    }
+    let names: Vec<String> = found.iter().take(10).map(|u| describe_user(u)).collect();
+    let more = if found.len() > names.len() {
+        ", …"
+    } else {
+        ""
+    };
+    Err(format!(
+        "{asked:?} matches more than one user {scope}: {}{more}; name one by email, \
+         username or account id",
+        names.join(", ")
+    ))
 }
 
 /// An issue's links to other issues, each read from this issue's side.
@@ -265,7 +331,9 @@ mod tests {
                 "status": status("In Progress"),
                 "issuetype": { "name": "Task" },
                 "priority": { "name": "Minor" },
-                "assignee": null,
+                "assignee": { "accountId": "5b10a2844c20165700ede21g",
+                              "displayName": "Ada Lovelace", "active": true },
+                "duedate": "2026-12-01",
                 "description": "h2. Goal",
                 "labels": ["etl", "fusion"],
                 "parent": { "id": "1", "key": "WRK-10", "fields": {
@@ -341,8 +409,60 @@ mod tests {
         assert_eq!(
             current,
             json!({ "summary": "Replace the scripts", "description": "h2. Goal",
-                    "priority": "Minor", "labels": ["etl", "fusion"], "parent": "WRK-10" })
+                    "priority": "Minor", "assignee": "Ada Lovelace",
+                    "assignee_ref": { "accountId": "5b10a2844c20165700ede21g" },
+                    "duedate": "2026-12-01", "labels": ["etl", "fusion"], "parent": "WRK-10" })
         );
+        let bare = current_view(&json!({ "fields": { "assignee": null } }));
+        assert_eq!(bare["assignee"], Value::Null);
+        assert_eq!(bare["assignee_ref"], Value::Null);
+        assert_eq!(bare["duedate"], Value::Null);
+    }
+
+    #[test]
+    fn a_user_is_written_by_account_id_on_cloud_and_by_name_on_data_center() {
+        assert_eq!(
+            user_ref(&json!({ "accountId": "abc", "name": "ignored" })),
+            Some(json!({ "accountId": "abc" }))
+        );
+        assert_eq!(
+            user_ref(&json!({ "name": "ada", "key": "JIRAUSER1" })),
+            Some(json!({ "name": "ada" }))
+        );
+        assert_eq!(user_ref(&Value::Null), None);
+    }
+
+    #[test]
+    fn a_user_is_picked_exactly_or_as_the_only_one_found() {
+        let users = [
+            json!({ "accountId": "1", "displayName": "Grace Hopper",
+                    "emailAddress": "grace@example.com" }),
+            json!({ "accountId": "2", "displayName": "Grace Kelly" }),
+        ];
+        let pick = |asked| pick_user(&users, asked, "assignable to WRK-1");
+        assert_eq!(pick("GRACE@example.com").unwrap()["accountId"], "1");
+        assert_eq!(pick("grace kelly").unwrap()["accountId"], "2");
+        assert_eq!(pick("2").unwrap()["accountId"], "2");
+        let e = pick("grace").unwrap_err();
+        assert_eq!(
+            e,
+            "\"grace\" matches more than one user assignable to WRK-1: Grace Hopper \
+             (grace@example.com), Grace Kelly (2); name one by email, username or account id"
+        );
+        assert_eq!(
+            pick_user(&users[1..], "Kel", "x").unwrap()["accountId"],
+            "2"
+        );
+        let e = pick_user(&[], "nobody", "assignable to WRK-1").unwrap_err();
+        assert_eq!(e, "no user assignable to WRK-1 matches \"nobody\"");
+        // Two people with the name asked are not told apart by guessing.
+        let twins = [
+            json!({ "accountId": "1", "displayName": "Sam" }),
+            json!({ "accountId": "2", "displayName": "Sam" }),
+            json!({ "accountId": "3", "displayName": "Samantha" }),
+        ];
+        let e = pick_user(&twins, "sam", "x").unwrap_err();
+        assert!(e.contains("Sam (1), Sam (2);"), "{e}");
     }
 
     fn blocks() -> LinkType {

@@ -55,6 +55,19 @@ struct IssueFields {
     description_file: Option<PathBuf>,
     #[arg(long)]
     priority: Option<String>,
+    /// Who to assign it: an account id, username, email, display name, or
+    /// "me". Found among the users Jira lets it be assigned to.
+    #[arg(long, conflicts_with = "unassign")]
+    assignee: Option<String>,
+    /// Leave it unassigned.
+    #[arg(long)]
+    unassign: bool,
+    /// The due date, as YYYY-MM-DD.
+    #[arg(long, value_name = "YYYY-MM-DD", conflicts_with = "clear_due")]
+    due: Option<String>,
+    /// Clear the due date.
+    #[arg(long)]
+    clear_due: bool,
     /// Comma-separated labels.
     #[arg(long, value_delimiter = ',')]
     labels: Option<Vec<String>>,
@@ -289,6 +302,16 @@ impl IssueFields {
         }
         if let Some(p) = self.priority {
             args.insert("priority".into(), json!(p));
+        }
+        if let Some(a) = self.assignee {
+            args.insert("assignee".into(), json!(a));
+        } else if self.unassign {
+            args.insert("assignee".into(), Value::Null);
+        }
+        if let Some(d) = self.due {
+            args.insert("duedate".into(), json!(d));
+        } else if self.clear_due {
+            args.insert("duedate".into(), Value::Null);
         }
         if let Some(l) = self.labels {
             args.insert("labels".into(), json!(l));

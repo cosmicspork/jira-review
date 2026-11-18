@@ -426,3 +426,279 @@ async fn a_jira_refusal_at_apply_is_reported_with_its_field_messages() {
         "{e:?}"
     );
 }
+
+const ADA: &str = "5b10a2844c20165700ede21g";
+
+#[tokio::test]
+async fn an_assignee_is_found_by_email_and_sent_as_the_account_with_a_due_date() {
+    let fake = Fake::start().await;
+    let p = propose(
+        &fake,
+        Kind::Update,
+        json!({ "key": "WRK-1", "assignee": "ada@example.com", "duedate": "2026-12-01" }),
+    )
+    .await;
+    assert_eq!(p.proposed["assignee"], "Ada Lovelace");
+    assert_eq!(p.proposed["assignee_ref"], json!({ "accountId": ADA }));
+    let shown = show(&p);
+    for line in [
+        "assignee:\n  - (none)\n  + Ada Lovelace\n",
+        "duedate:\n  - (none)\n  + 2026-12-01\n",
+    ] {
+        assert!(shown.contains(line), "{shown}");
+    }
+
+    let result = change::apply(&p, &fake.client(), None).await.unwrap();
+    assert_eq!(
+        result,
+        json!({ "key": "WRK-1", "updated": ["assignee", "duedate"] })
+    );
+    let writes = fake.writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(
+        writes[0].body,
+        json!({ "fields": { "assignee": { "accountId": ADA }, "duedate": "2026-12-01" } })
+    );
+    assert_eq!(
+        fake.issue("WRK-1")["fields"]["assignee"]["displayName"],
+        "Ada Lovelace"
+    );
+
+    // The same person again is nothing to change, however they are named.
+    let e = change::propose(
+        Kind::Update,
+        &json!({ "key": "WRK-1", "assignee": "Ada Lovelace" }),
+        &fake.client(),
+    )
+    .await
+    .unwrap_err();
+    assert!(e.contains("nothing would change"), "{e}");
+
+    // Unassigning and clearing the date send null, and look nobody up.
+    fake.clear();
+    let p = propose(
+        &fake,
+        Kind::Update,
+        json!({ "key": "WRK-1", "assignee": null, "duedate": null }),
+    )
+    .await;
+    let shown = show(&p);
+    assert!(
+        shown.contains("assignee:\n  - Ada Lovelace\n  + (none)\n"),
+        "{shown}"
+    );
+    change::apply(&p, &fake.client(), None).await.unwrap();
+    assert_eq!(
+        fake.writes()[0].body,
+        json!({ "fields": { "assignee": null, "duedate": null } })
+    );
+    assert!(
+        fake.requests().iter().all(|r| !r.path.contains("/user/")),
+        "{:?}",
+        fake.requests()
+    );
+}
+
+#[tokio::test]
+async fn an_assignee_is_searched_among_who_the_issue_can_be_assigned_to() {
+    let fake = Fake::start().await;
+    let p = change::propose(
+        Kind::Update,
+        &json!({ "key": "WRK-2", "assignee": "grace hopper" }),
+        &fake.client(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        p.proposed["assignee_ref"],
+        json!({ "accountId": "5b10ac8d82e05b22cc7d4ef5" })
+    );
+    let search = fake
+        .requests()
+        .into_iter()
+        .find(|r| r.path == "/rest/api/2/user/assignable/search")
+        .unwrap();
+    assert!(search.query.contains("issueKey=WRK-2"), "{}", search.query);
+    assert!(
+        search.query.contains("query=grace+hopper"),
+        "{}",
+        search.query
+    );
+
+    // A name that matches several people is refused with who they are.
+    let e = change::propose(
+        Kind::Update,
+        &json!({ "key": "WRK-2", "assignee": "grace" }),
+        &fake.client(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        e.contains("matches more than one user assignable to WRK-2")
+            && e.contains("Grace Hopper (grace@example.com)")
+            && e.contains("Grace Kelly (gkelly@example.com)"),
+        "{e}"
+    );
+    let e = change::propose(
+        Kind::Update,
+        &json!({ "key": "WRK-2", "assignee": "nobody" }),
+        &fake.client(),
+    )
+    .await
+    .unwrap_err();
+    assert!(e.contains("no user assignable to WRK-2 matches"), "{e}");
+
+    // An account id is not something Cloud's query matches, so it is asked
+    // for by id.
+    let p = change::propose(
+        Kind::Update,
+        &json!({ "key": "WRK-2", "assignee": "712020:0e1a6b5c" }),
+        &fake.client(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(p.proposed["assignee"], "Grace Kelly");
+
+    // "me" is the credential's own user.
+    let p = change::propose(
+        Kind::Update,
+        &json!({ "key": "WRK-2", "assignee": "me" }),
+        &fake.client(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        p.proposed["assignee_ref"],
+        json!({ "accountId": "557058:me" })
+    );
+    assert!(fake.writes().is_empty());
+}
+
+#[tokio::test]
+async fn data_center_finds_an_assignee_by_username_and_takes_them_by_name() {
+    let fake = Fake::start().await;
+    fake.data_center();
+    let jira = fake.data_center_client();
+    let p = change::propose(
+        Kind::Update,
+        &json!({ "key": "WRK-1", "assignee": "grace" }),
+        &jira,
+    )
+    .await
+    .unwrap();
+    assert_eq!(p.proposed["assignee"], "Grace Hopper");
+    assert_eq!(p.proposed["assignee_ref"], json!({ "name": "grace" }));
+    let search = fake
+        .requests()
+        .into_iter()
+        .find(|r| r.path.ends_with("/assignable/search"))
+        .unwrap();
+    assert!(search.query.contains("username=grace"), "{}", search.query);
+    fake.clear();
+    change::apply(&p, &jira, None).await.unwrap();
+    assert_eq!(
+        fake.writes()[0].body,
+        json!({ "fields": { "assignee": { "name": "grace" } } })
+    );
+}
+
+#[tokio::test]
+async fn a_change_naming_an_assignee_without_their_account_is_not_applied() {
+    let fake = Fake::start().await;
+    let mut p = propose(
+        &fake,
+        Kind::Update,
+        json!({ "key": "WRK-1", "assignee": "ada" }),
+    )
+    .await;
+    p.proposed["assignee_ref"] = Value::Null;
+    let e = change::apply(&p, &fake.client(), None).await.unwrap_err();
+    assert!(
+        matches!(&e, ApplyError::Invalid(m) if m.contains("holds no account")),
+        "{e:?}"
+    );
+    assert!(
+        fake.requests().is_empty(),
+        "checked before anything is read"
+    );
+}
+
+#[tokio::test]
+async fn new_issues_are_created_assigned_and_due() {
+    let fake = Fake::start().await;
+    let p = propose(
+        &fake,
+        Kind::Create,
+        json!({ "issues": [
+            { "project": "WRK", "type": "Epic", "summary": "Port the feed",
+              "assignee": "ada", "duedate": "2026-12-01" },
+            { "project": "WRK", "type": "Story", "summary": "Read it", "parent": "#0",
+              "assignee": "Ada" },
+            { "project": "WRK", "type": "Story", "summary": "Write it", "assignee": null },
+        ] }),
+    )
+    .await;
+    let shown = show(&p);
+    assert!(
+        shown.contains(
+            "  + [0] WRK Epic: Port the feed\n      assignee: Ada Lovelace\n      \
+             duedate: 2026-12-01\n"
+        ),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("  + [2] WRK Story: Write it\n      assignee: (none)\n"),
+        "{shown}"
+    );
+    change::apply(&p, &fake.client(), None).await.unwrap();
+    let writes = fake.writes();
+    assert_eq!(writes.len(), 3);
+    assert_eq!(
+        writes[0].body["fields"]["assignee"],
+        json!({ "accountId": ADA })
+    );
+    assert_eq!(writes[0].body["fields"]["duedate"], "2026-12-01");
+    assert_eq!(
+        writes[1].body["fields"]["assignee"],
+        json!({ "accountId": ADA })
+    );
+    assert_eq!(writes[2].body["fields"]["assignee"], Value::Null);
+    assert!(writes[2].body["fields"].get("duedate").is_none());
+}
+
+#[tokio::test]
+async fn a_new_issues_assignee_is_searched_once_per_project_and_name() {
+    let fake = Fake::start().await;
+    change::propose(
+        Kind::Create,
+        &json!({ "issues": [
+            { "project": "WRK", "type": "Task", "summary": "a", "assignee": "ada" },
+            { "project": "WRK", "type": "Task", "summary": "b", "assignee": "ADA" },
+        ] }),
+        &fake.client(),
+    )
+    .await
+    .unwrap();
+    let searches: Vec<_> = fake
+        .requests()
+        .into_iter()
+        .filter(|r| r.path.ends_with("/assignable/search"))
+        .collect();
+    assert_eq!(searches.len(), 1);
+    assert!(
+        searches[0].query.contains("project=WRK"),
+        "{}",
+        searches[0].query
+    );
+    let e = change::propose(
+        Kind::Create,
+        &json!({ "project": "WRK", "type": "Task", "summary": "a", "assignee": "grace" }),
+        &fake.client(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        e.starts_with("issues[0]: assignee: \"grace\" matches more than one user"),
+        "{e}"
+    );
+}

@@ -134,6 +134,10 @@ fn string(description: &str) -> Value {
     json!({ "type": "string", "description": description })
 }
 
+fn nullable(description: &str) -> Value {
+    json!({ "type": ["string", "null"], "description": description })
+}
+
 fn strings(description: &str) -> Value {
     json!({ "type": "array", "items": { "type": "string" }, "description": description })
 }
@@ -148,6 +152,9 @@ pub fn definitions(profile: bool, write_note: &str) -> Vec<Value> {
         "summary": { "type": "string" },
         "description": string("Jira wiki markup, not Markdown."),
         "priority": string("Priority name, e.g. High."),
+        "assignee": nullable("Who to assign it: account id, username, email, display name, or \
+                              \"me\"."),
+        "duedate": nullable("Due date, YYYY-MM-DD."),
         "labels": strings("Single tokens, no spaces."),
         "parent": string("Parent issue key; in issues, #N for an earlier item."),
     });
@@ -174,7 +181,8 @@ pub fn definitions(profile: bool, write_note: &str) -> Vec<Value> {
         json!({
             "name": "search",
             "description": "Search Jira issues with JQL. One row per issue: key, type, summary, \
-                            status, priority, assignee, parent, labels. Read one in full with issue.",
+                            status, priority, assignee, duedate, parent, labels. Read one in full \
+                            with issue.",
             "inputSchema": { "type": "object", "properties": {
                 "jql": string("e.g. project = WRK AND statusCategory != Done ORDER BY updated DESC"),
                 "limit": { "type": "integer", "description": "At most 50; 20 unless you say." },
@@ -183,7 +191,7 @@ pub fn definitions(profile: bool, write_note: &str) -> Vec<Value> {
         }),
         json!({
             "name": "issue",
-            "description": "A Jira issue: summary, status, assignee, description (wiki markup), \
+            "description": "A Jira issue: summary, status, assignee, duedate, description (wiki markup), \
                             labels, parent, links (each with its direction and wording), \
                             subtasks, created, updated, and its ten most recent comments.",
             "inputSchema": { "type": "object", "properties": { "key": key },
@@ -202,7 +210,8 @@ pub fn definitions(profile: bool, write_note: &str) -> Vec<Value> {
         json!({
             "name": "update",
             "description": format!(
-                "Edit an issue's summary, description, priority, labels or parent. add_labels \
+                "Edit an issue's summary, description, priority, assignee, due date, labels or \
+                 parent. add_labels \
                  and remove_labels change labels relative to what the issue has; labels \
                  replaces them all and is not taken with either. Status changes only through \
                  transition. {write_note}"
@@ -212,6 +221,11 @@ pub fn definitions(profile: bool, write_note: &str) -> Vec<Value> {
                 "summary": { "type": "string" },
                 "description": string("Jira wiki markup, not Markdown."),
                 "priority": string("Priority name, e.g. High."),
+                "assignee": nullable("Who to assign it: account id, username, email, display \
+                                      name, or \"me\"; found among the users the issue can be \
+                                      assigned to, and refused with the candidates when it \
+                                      names several. null unassigns."),
+                "duedate": nullable("Due date, YYYY-MM-DD; null clears it."),
                 "labels": strings("Replaces the issue's labels. Single tokens, no spaces."),
                 "add_labels": strings("Labels to add, keeping the rest."),
                 "remove_labels": strings("Labels to remove, keeping the rest. Matched ignoring \

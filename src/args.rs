@@ -7,7 +7,15 @@ use serde_json::{Map, Value, json};
 /// The fields `update` and `create` may set. Status is deliberately absent;
 /// so is everything else Jira would accept, because a field this list does
 /// not name is one nobody decided a write should touch.
-pub const EDITABLE: &[&str] = &["summary", "description", "priority", "labels", "parent"];
+pub const EDITABLE: &[&str] = &[
+    "summary",
+    "description",
+    "priority",
+    "assignee",
+    "duedate",
+    "labels",
+    "parent",
+];
 
 /// Label edits relative to whatever the issue has when the change applies,
 /// which only `update` takes.
@@ -106,10 +114,73 @@ pub fn fields_from(
                 let p = issue_key(Some(v), "parent")?;
                 fields.insert(k.clone(), json!({ "key": p }));
             }
+            "duedate" => {
+                fields.insert(k.clone(), due_date(v)?);
+            }
+            // A user is named as a person would name them, and Jira takes an
+            // account: `assignee_arg` reads it, and propose resolves it.
+            "assignee" => {
+                assignee_arg(args)?;
+            }
             _ => unreachable!("every editable field is handled"),
         }
     }
     Ok(fields)
+}
+
+/// A due date as Jira takes it: `YYYY-MM-DD`, a day that exists, or null to
+/// clear it.
+pub fn due_date(v: &Value) -> Result<Value, String> {
+    if v.is_null() {
+        return Ok(Value::Null);
+    }
+    let wrong = || "duedate expects a date as YYYY-MM-DD, or null to clear it".to_string();
+    let s = v.as_str().map(str::trim).ok_or_else(wrong)?;
+    let parts: Vec<&str> = s.split('-').collect();
+    let [y, m, d] = parts.as_slice() else {
+        return Err(wrong());
+    };
+    if y.len() != 4 || m.len() != 2 || d.len() != 2 {
+        return Err(wrong());
+    }
+    let number = |p: &str| -> Result<u16, String> {
+        if p.chars().all(|c| c.is_ascii_digit()) {
+            p.parse().map_err(|_| wrong())
+        } else {
+            Err(wrong())
+        }
+    };
+    let (y, m, d) = (number(y)?, number(m)?, number(d)?);
+    let month = u8::try_from(m)
+        .ok()
+        .and_then(|m| time::Month::try_from(m).ok())
+        .ok_or_else(|| format!("duedate {s}: there is no month {m}"))?;
+    time::Date::from_calendar_date(i32::from(y), month, d as u8)
+        .map_err(|_| format!("duedate {s}: {month} {y} has no day {d}"))?;
+    Ok(json!(s))
+}
+
+/// The user word that means the credential's own user.
+pub const ME: &str = "me";
+
+/// The `assignee` a write names: absent (`None`), null to unassign
+/// (`Some(None)`), or a user to find (`Some(Some(..))`): an account id, a
+/// username, an email, a display name, or `me`.
+pub fn assignee_arg(args: &Value) -> Result<Option<Option<&str>>, String> {
+    match args.get("assignee") {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(v) => v
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| Some(Some(s)))
+            .ok_or_else(|| {
+                "assignee expects a user (account id, username, email or display name), \
+                 \"me\", or null to unassign"
+                    .into()
+            }),
+    }
 }
 
 /// Jira's `update` verbs for `add_labels` and `remove_labels`, in that order:
@@ -192,6 +263,9 @@ pub fn label_list(v: &Value, field: &str) -> Result<Vec<String>, String> {
 pub struct NewIssue {
     pub fields: Map<String, Value>,
     pub parent_item: Option<usize>,
+    /// The user it is to be assigned, as named (see [`assignee_arg`]); the
+    /// account it resolved to is the proposal's, put in `fields` at apply.
+    pub assignee: Option<Option<String>>,
 }
 
 /// What a `create` would make, in order, every item checked up front so that
@@ -286,9 +360,11 @@ fn new_issue(args: &Value, index: Option<usize>) -> Result<NewIssue, String> {
     }
     fields.insert("project".into(), json!({ "key": project }));
     fields.insert("issuetype".into(), json!({ "name": kind }));
+    let assignee = assignee_arg(args)?.map(|a| a.map(str::to_string));
     Ok(NewIssue {
         fields,
         parent_item,
+        assignee,
     })
 }
 
@@ -371,6 +447,61 @@ mod tests {
         assert!(e.contains("Blocks, Relates"), "{e}");
         let e = link_type(&[], "Blocks").unwrap_err();
         assert!(e.contains("lists none"), "{e}");
+    }
+
+    #[test]
+    fn a_due_date_is_a_day_that_exists_or_null() {
+        assert_eq!(due_date(&json!("2026-12-01")).unwrap(), json!("2026-12-01"));
+        assert_eq!(
+            due_date(&json!(" 2028-02-29 ")).unwrap(),
+            json!("2028-02-29")
+        );
+        assert_eq!(due_date(&Value::Null).unwrap(), Value::Null);
+        for wrong in [
+            json!("12/01/2026"),
+            json!("2026-1-01"),
+            json!("next week"),
+            json!(3),
+        ] {
+            let e = due_date(&wrong).unwrap_err();
+            assert!(e.contains("YYYY-MM-DD"), "{wrong}: {e}");
+        }
+        let e = due_date(&json!("2026-02-29")).unwrap_err();
+        assert_eq!(e, "duedate 2026-02-29: February 2026 has no day 29");
+        let e = due_date(&json!("2026-13-01")).unwrap_err();
+        assert_eq!(e, "duedate 2026-13-01: there is no month 13");
+        let f = fields_from(&json!({ "duedate": null }), "update", &[]).unwrap();
+        assert_eq!(f["duedate"], Value::Null);
+    }
+
+    #[test]
+    fn an_assignee_is_a_user_to_find_or_null_and_not_a_field_as_given() {
+        assert_eq!(assignee_arg(&json!({})).unwrap(), None);
+        assert_eq!(
+            assignee_arg(&json!({ "assignee": null })).unwrap(),
+            Some(None)
+        );
+        assert_eq!(
+            assignee_arg(&json!({ "assignee": " ada@example.com " })).unwrap(),
+            Some(Some("ada@example.com"))
+        );
+        for wrong in [json!(""), json!(" "), json!({ "accountId": "x" })] {
+            let e = assignee_arg(&json!({ "assignee": wrong })).unwrap_err();
+            assert!(e.contains("null to unassign"), "{e}");
+        }
+        // Found by propose, so never sent as the caller spelled it.
+        let f = fields_from(&json!({ "assignee": "ada", "summary": "s" }), "update", &[]).unwrap();
+        assert!(!f.contains_key("assignee"));
+        let plan = create_plan(&json!({ "issues": [
+            { "project": "WRK", "type": "Task", "summary": "a", "assignee": "me" },
+            { "project": "WRK", "type": "Task", "summary": "b", "assignee": null },
+            { "project": "WRK", "type": "Task", "summary": "c" },
+        ] }))
+        .unwrap();
+        assert_eq!(plan[0].assignee, Some(Some("me".to_string())));
+        assert_eq!(plan[1].assignee, Some(None));
+        assert_eq!(plan[2].assignee, None);
+        assert!(plan.iter().all(|i| !i.fields.contains_key("assignee")));
     }
 
     #[test]

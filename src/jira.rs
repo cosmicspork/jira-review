@@ -5,8 +5,8 @@
 use reqwest::{Method, StatusCode};
 use serde_json::{Map, Value, json};
 
-use crate::args::LinkType;
-use crate::auth::Credential;
+use crate::args::{self, LinkType};
+use crate::auth::{Auth, Credential};
 use crate::views;
 
 #[derive(Clone)]
@@ -172,6 +172,60 @@ impl Jira {
                 })
             })
             .collect())
+    }
+
+    /// The credential's own user.
+    pub async fn myself(&self) -> Result<Value, String> {
+        self.expect(
+            "jira did not say who this credential is",
+            Method::GET,
+            "/rest/api/2/myself",
+            &[],
+            None,
+        )
+        .await
+    }
+
+    /// The user `asked` names, among those who can be assigned within
+    /// `scope` (`issueKey` or `project`, and its value): `{ "name", "ref" }`,
+    /// the display name a reviewer reads and the account Jira takes.
+    ///
+    /// Cloud finds users by `query` (name or email) and, failing that, by
+    /// `accountId`; Data Center by `username` (username, name or email).
+    pub async fn assignee(&self, asked: &str, scope: (&str, &str)) -> Result<Value, String> {
+        let user = if asked.eq_ignore_ascii_case(args::ME) {
+            self.myself().await?
+        } else {
+            let (by, value) = scope;
+            let within = format!("assignable to {value}");
+            let find = |param: &'static str| async move {
+                self.expect(
+                    "jira did not list assignable users",
+                    Method::GET,
+                    "/rest/api/2/user/assignable/search",
+                    &[(by, value), (param, asked), ("maxResults", "20")],
+                    None,
+                )
+                .await
+                .map(|v| v.as_array().cloned().unwrap_or_default())
+            };
+            let mut users = match self.cred.auth {
+                Auth::Basic { .. } => find("query").await?,
+                Auth::Bearer { .. } => find("username").await?,
+            };
+            // An account id is not something Cloud's `query` matches.
+            if users.is_empty()
+                && matches!(self.cred.auth, Auth::Basic { .. })
+                && !asked.contains(char::is_whitespace)
+                && !asked.contains('@')
+            {
+                users = find("accountId").await.unwrap_or_default();
+            }
+            views::pick_user(&users, asked, &within)?.clone()
+        };
+        let reference = views::user_ref(&user)
+            .ok_or_else(|| format!("jira answered for {asked:?} without an account id or name"))?;
+        Ok(json!({ "name": user["displayName"], "ref": reference }))
     }
 
     /// Edit an issue: `fields` set, `update` edits applied.

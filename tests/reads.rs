@@ -11,7 +11,7 @@ async fn search_uses_the_cloud_endpoint_and_returns_rows() {
     assert_eq!(
         v["issues"][0],
         json!({ "key": "WRK-1", "type": "Task", "summary": "Port the feed", "status": "To Do",
-                "priority": "Medium", "assignee": null, "parent": null,
+                "priority": "Medium", "assignee": null, "duedate": null, "parent": null,
                 "labels": ["etl", "Stale"] })
     );
     let r = fake.requests();
