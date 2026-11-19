@@ -75,6 +75,24 @@ impl Jira {
             .unwrap_or(Value::Null)
     }
 
+    /// Issues `start..start + limit` in key order, each with an id, and
+    /// whether that is the last of them.
+    fn page(&self, start: usize, limit: usize) -> (Vec<Value>, bool) {
+        let issues = self
+            .issues
+            .values()
+            .enumerate()
+            .skip(start)
+            .take(limit)
+            .map(|(n, i)| {
+                let mut i = i.clone();
+                i["id"] = json!((10_000 + n).to_string());
+                i
+            })
+            .collect();
+        (issues, start + limit >= self.issues.len())
+    }
+
     fn summary_of(&self, key: &str) -> Value {
         let f = &self.issues[key]["fields"];
         json!({ "summary": f["summary"], "status": f["status"] })
@@ -88,7 +106,12 @@ pub struct Fake {
 }
 
 fn status(name: &str) -> Value {
-    json!({ "name": name, "statusCategory": { "name": name } })
+    let key = match name {
+        "To Do" => "new",
+        "Done" => "done",
+        _ => "indeterminate",
+    };
+    json!({ "name": name, "statusCategory": { "key": key, "name": name } })
 }
 
 fn issue(key: &str, summary: &str, kind: &str, labels: &[&str]) -> Value {
@@ -244,6 +267,12 @@ fn answer(status: u16, body: Value) -> Response {
     }
 }
 
+fn param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
+    query
+        .split('&')
+        .find_map(|p| p.strip_prefix(name)?.strip_prefix('='))
+}
+
 fn missing(key: &str) -> Response {
     answer(
         404,
@@ -280,18 +309,36 @@ async fn handle(
         return answer(status, body);
     }
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-    let limit = query
-        .split('&')
-        .find_map(|p| p.strip_prefix("maxResults="))
+    let limit = param(&query, "maxResults")
         .and_then(|n| n.parse().ok())
         .unwrap_or(50);
     match (method.as_str(), parts.as_slice()) {
         ("GET", ["rest", "api", "3", "search", "jql"]) if j.data_center => {
             answer(404, json!({ "errorMessages": ["no such endpoint"] }))
         }
-        ("GET", ["rest", "api", "3", "search", "jql"] | ["rest", "api", "2", "search"]) => {
-            let issues: Vec<Value> = j.issues.values().take(limit).cloned().collect();
-            answer(200, json!({ "issues": issues }))
+        // Cloud pages by an opaque token, Data Center by offset.
+        ("GET", ["rest", "api", "3", "search", "jql"]) => {
+            let start = match param(&query, "nextPageToken") {
+                None => 0,
+                Some(t) => match t.strip_prefix("page-").and_then(|n| n.parse().ok()) {
+                    Some(n) => n,
+                    None => return answer(400, json!({ "errorMessages": ["bad nextPageToken"] })),
+                },
+            };
+            let (issues, last) = j.page(start, limit);
+            let mut v = json!({ "issues": issues, "isLast": last });
+            if !last {
+                v["nextPageToken"] = json!(format!("page-{}", start + limit));
+            }
+            answer(200, v)
+        }
+        ("GET", ["rest", "api", "2", "search"]) => {
+            let start = param(&query, "startAt").map_or(0, |n| n.parse().unwrap());
+            let (issues, _) = j.page(start, limit);
+            answer(
+                200,
+                json!({ "issues": issues, "startAt": start, "total": j.issues.len() }),
+            )
         }
         ("GET", ["rest", "api", "2", "issue", key]) => match j.issues.get(*key) {
             Some(i) => answer(200, i.clone()),

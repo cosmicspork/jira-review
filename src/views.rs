@@ -16,6 +16,34 @@ pub const ISSUE_FIELDS: &str = "summary,status,assignee,duedate,description,comm
 pub const CURRENT_FIELDS: &str =
     "summary,description,priority,assignee,duedate,labels,parent,updated";
 
+/// What a paged `search` reads.
+pub const PAGE_FIELDS: &str = "summary,status,priority,issuetype,labels,parent";
+
+/// One row of a paged `search`, as Tracon's `GET /api/jira/search` answers it.
+pub fn page_row(i: &Value) -> Value {
+    let f = &i["fields"];
+    let p = &f["parent"];
+    json!({
+        "id": i["id"],
+        "key": i["key"],
+        "summary": f["summary"],
+        "status": f["status"]["name"],
+        "status_category": f["status"]["statusCategory"]["key"],
+        "priority": f["priority"]["name"],
+        "issue_type": f["issuetype"]["name"],
+        "labels": f["labels"].as_array().cloned().unwrap_or_default(),
+        "parent": if p.is_object() {
+            json!({
+                "key": p["key"],
+                "summary": p["fields"]["summary"],
+                "issue_type": p["fields"]["issuetype"]["name"],
+            })
+        } else {
+            Value::Null
+        },
+    })
+}
+
 /// One `search` row.
 pub fn search_row(i: &Value) -> Value {
     let f = &i["fields"];

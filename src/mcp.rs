@@ -146,11 +146,16 @@ fn strings(description: &str) -> Value {
 /// that picks which lent credential a plugin call uses.
 pub fn definitions(profile: bool, write_note: &str) -> Vec<Value> {
     let key = string("Issue key, e.g. WRK-123.");
+    let format = json!({
+        "type": "string", "enum": ["jira_wiki", "markdown"],
+        "description": "What the text is written in: jira_wiki unless you say. Markdown is \
+                        converted to wiki markup, and the change shows what will be sent.",
+    });
     let issue_fields = json!({
         "project": string("Project key, e.g. WRK."),
         "type": string("Issue type name, e.g. Task."),
         "summary": { "type": "string" },
-        "description": string("Jira wiki markup, not Markdown."),
+        "description": string("Jira wiki markup, or Markdown with format markdown."),
         "priority": string("Priority name, e.g. High."),
         "assignee": nullable("Who to assign it: account id, username, email, display name, or \
                               \"me\"."),
@@ -162,6 +167,7 @@ pub fn definitions(profile: bool, write_note: &str) -> Vec<Value> {
         "type": "object",
         "properties": issue_fields.clone(),
     });
+    create["properties"]["format"] = format.clone();
     create["properties"]["issues"] = json!({
         "type": "array",
         "description": format!(
@@ -182,10 +188,17 @@ pub fn definitions(profile: bool, write_note: &str) -> Vec<Value> {
             "name": "search",
             "description": "Search Jira issues with JQL. One row per issue: key, type, summary, \
                             status, priority, assignee, duedate, parent, labels. Read one in full \
-                            with issue.",
+                            with issue. With page or a cursor it answers one page instead: \
+                            { site, account_email, issues (id, key, summary, status, \
+                            status_category, priority, issue_type, labels, parent), \
+                            next_cursor }, next_cursor null after the last page.",
             "inputSchema": { "type": "object", "properties": {
                 "jql": string("e.g. project = WRK AND statusCategory != Done ORDER BY updated DESC"),
-                "limit": { "type": "integer", "description": "At most 50; 20 unless you say." },
+                "limit": { "type": "integer",
+                           "description": "At most 50, 20 unless you say; paged, at most 100, \
+                                           100 unless you say." },
+                "page": { "type": "boolean", "description": "Answer the first page." },
+                "cursor": string("The next_cursor of the page before: answers the next page."),
             }, "required": ["jql"] },
             "annotations": read,
         }),
@@ -219,7 +232,8 @@ pub fn definitions(profile: bool, write_note: &str) -> Vec<Value> {
             "inputSchema": { "type": "object", "properties": {
                 "key": key,
                 "summary": { "type": "string" },
-                "description": string("Jira wiki markup, not Markdown."),
+                "description": string("Jira wiki markup, or Markdown with format markdown."),
+                "format": format.clone(),
                 "priority": string("Priority name, e.g. High."),
                 "assignee": nullable("Who to assign it: account id, username, email, display \
                                       name, or \"me\"; found among the users the issue can be \
@@ -278,11 +292,12 @@ pub fn definitions(profile: bool, write_note: &str) -> Vec<Value> {
             "name": "comment",
             "description": format!(
                 "Comment on an issue. The body is Jira wiki markup (*bold*, {{{{code}}}}, \
-                 * bullets), not Markdown. {write_note}"
+                 * bullets), or Markdown with format markdown. {write_note}"
             ),
             "inputSchema": { "type": "object", "properties": {
                 "key": key,
-                "body": string("Jira wiki markup."),
+                "body": string("Jira wiki markup, or Markdown with format markdown."),
+                "format": format,
             }, "required": ["key", "body"] },
             "annotations": write(false),
         }),
@@ -300,13 +315,28 @@ pub fn definitions(profile: bool, write_note: &str) -> Vec<Value> {
 pub async fn read(name: &str, args: &Value, jira: &Jira) -> Result<Value, String> {
     match name {
         "search" => {
-            crate::args::only(args, "search", &["jql", "limit"])?;
+            crate::args::only(args, "search", &["jql", "limit", "cursor", "page"])?;
             let jql = crate::args::text(args, "jql")?;
+            let cursor = match args.get("cursor") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(c)) => Some(c.as_str()),
+                Some(_) => return Err("cursor expects a string".into()),
+            };
+            let page = match args.get("page") {
+                None | Some(Value::Null) => false,
+                Some(v) => v.as_bool().ok_or("page expects true or false")?,
+            };
+            let paged = page || cursor.is_some();
             let limit = match args.get("limit") {
+                None | Some(Value::Null) if paged => 100,
                 None | Some(Value::Null) => 20,
                 Some(v) => v.as_u64().ok_or("limit expects a positive integer")?,
             };
-            jira.search(jql, limit).await
+            if paged {
+                jira.search_page(jql, limit, cursor).await
+            } else {
+                jira.search(jql, limit).await
+            }
         }
         "issue" | "transitions" => {
             crate::args::only(args, name, &["key"])?;
