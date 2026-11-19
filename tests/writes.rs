@@ -702,3 +702,69 @@ async fn a_new_issues_assignee_is_searched_once_per_project_and_name() {
         "{e}"
     );
 }
+
+#[tokio::test]
+async fn markdown_input_is_proposed_as_the_wiki_markup_it_sends() {
+    let fake = Fake::start().await;
+    let markdown = "## Goal\n\nMove the **feed**.";
+    let wiki = jira_review::wiki::from_markdown(markdown);
+    assert!(wiki.contains("h2. Goal"), "{wiki}");
+
+    let p = propose(
+        &fake,
+        Kind::Update,
+        json!({ "key": "WRK-1", "description": markdown, "format": "markdown" }),
+    )
+    .await;
+    assert_eq!(p.args, json!({ "key": "WRK-1", "description": wiki }));
+    assert_eq!(p.proposed["description"], wiki.as_str());
+
+    let p = propose(
+        &fake,
+        Kind::Comment,
+        json!({ "key": "WRK-1", "body": markdown, "format": "markdown" }),
+    )
+    .await;
+    assert_eq!(p.args, json!({ "key": "WRK-1", "body": wiki }));
+    change::apply(&p, &fake.client(), None).await.unwrap();
+    assert_eq!(fake.writes()[0].body, json!({ "body": wiki }));
+    fake.clear();
+
+    let p = propose(
+        &fake,
+        Kind::Create,
+        json!({ "format": "markdown", "issues": [
+            { "project": "WRK", "type": "Task", "summary": "One", "description": markdown },
+            { "project": "WRK", "type": "Task", "summary": "Two" },
+        ] }),
+    )
+    .await;
+    assert_eq!(p.args["issues"][0]["description"], wiki.as_str());
+    assert!(p.args.get("format").is_none());
+
+    let p = propose(
+        &fake,
+        Kind::Comment,
+        json!({ "key": "WRK-1", "body": "**as is**", "format": "jira_wiki" }),
+    )
+    .await;
+    assert_eq!(p.args, json!({ "key": "WRK-1", "body": "**as is**" }));
+
+    let client = fake.client();
+    let e = change::propose(
+        Kind::Comment,
+        &json!({ "key": "WRK-1", "body": "x", "format": "html" }),
+        &client,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(e, "format expects markdown or jira_wiki");
+    let e = change::propose(
+        Kind::Transition,
+        &json!({ "key": "WRK-1", "transition": "Start", "format": "markdown" }),
+        &client,
+    )
+    .await
+    .unwrap_err();
+    assert!(e.contains("does not take format"), "{e}");
+}

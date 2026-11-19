@@ -196,13 +196,22 @@ pub fn now() -> String {
 }
 
 /// Propose a write: read what it would change, and return the change
-/// without sending anything.
+/// without sending anything. Markdown given with `format: "markdown"` is
+/// converted first, so the proposal's `args` hold the wiki markup it sends.
 ///
 /// This is the seam for Tracon's `tracon/preview`: the proposal is the
 /// preview's answer and its `versions` the version token the node hands back
 /// with an approved call, for [`apply`]'s `expected`. That method is not
 /// built yet.
 pub async fn propose(kind: Kind, args: &Value, jira: &Jira) -> Result<Proposal, String> {
+    let converted;
+    let args = match kind {
+        Kind::Update | Kind::Create | Kind::Comment => {
+            converted = args::wiki_input(args)?;
+            &converted
+        }
+        Kind::Transition | Kind::Link => args,
+    };
     let (versions, current, proposed) = match kind {
         Kind::Update => propose_update(args, jira).await?,
         Kind::Transition => propose_transition(args, jira).await?,

@@ -40,6 +40,41 @@ pub fn text<'a>(args: &'a Value, field: &str) -> Result<&'a str, String> {
         .ok_or_else(|| format!("{field} is required"))
 }
 
+/// A write's arguments with `format` taken out. With `"markdown"`, the text
+/// it carries (`description`, on each of `issues` too, and a comment's
+/// `body`) is converted to wiki markup, which is what the change shows and
+/// sends; `"jira_wiki"`, or no `format`, takes the text as it is.
+pub fn wiki_input(args: &Value) -> Result<Value, String> {
+    let mut args = args.clone();
+    let Some(o) = args.as_object_mut() else {
+        return Ok(args);
+    };
+    let markdown = match o.remove("format") {
+        None | Some(Value::Null) => false,
+        Some(Value::String(f)) if f == "jira_wiki" => false,
+        Some(Value::String(f)) if f == "markdown" => true,
+        Some(_) => return Err("format expects markdown or jira_wiki".into()),
+    };
+    if markdown {
+        let convert = |item: &mut Map<String, Value>| {
+            for field in ["description", "body"] {
+                if let Some(Value::String(s)) = item.get(field) {
+                    let wiki = crate::wiki::from_markdown(s);
+                    item.insert(field.into(), Value::String(wiki));
+                }
+            }
+        };
+        convert(o);
+        if let Some(Value::Array(items)) = o.get_mut("issues") {
+            items
+                .iter_mut()
+                .filter_map(Value::as_object_mut)
+                .for_each(convert);
+        }
+    }
+    Ok(args)
+}
+
 /// Refuse any argument `allowed` does not name, so that a write never does
 /// less than it was asked to without saying so.
 pub fn only(args: &Value, verb: &str, allowed: &[&str]) -> Result<(), String> {

@@ -101,6 +101,85 @@ impl Jira {
         Ok(json!({ "issues": issues }))
     }
 
+    /// One page of a search, up to `limit` (at most 100) rows, after
+    /// `cursor`: the site, the credential's email, the rows, and the cursor
+    /// for the next page, or null after the last.
+    ///
+    /// Cloud's cursor is the `nextPageToken` it hands out. Data Center has
+    /// only the older endpoint, which pages by offset, so its cursor is the
+    /// next offset as a decimal string.
+    pub async fn search_page(
+        &self,
+        jql: &str,
+        limit: u64,
+        cursor: Option<&str>,
+    ) -> Result<Value, String> {
+        let jql = jql.trim();
+        if jql.is_empty() {
+            return Err("jql is required".into());
+        }
+        let site = reqwest::Url::parse(self.url())
+            .map(|u| u.origin().ascii_serialization())
+            .map_err(|e| format!("JIRA_URL is not a URL: {e}"))?;
+        let limit = limit.clamp(1, 100).to_string();
+        let mut v3 = vec![
+            ("jql", jql),
+            ("fields", views::PAGE_FIELDS),
+            ("maxResults", limit.as_str()),
+        ];
+        if let Some(c) = cursor {
+            v3.push(("nextPageToken", c));
+        }
+        let (mut status, mut v) = self
+            .send(Method::GET, "/rest/api/3/search/jql", &v3, None)
+            .await?;
+        let mut start_at = None;
+        if status == StatusCode::NOT_FOUND {
+            let start: u64 = match cursor {
+                Some(c) => c.parse().map_err(|_| format!("bad cursor: {c}"))?,
+                None => 0,
+            };
+            let start_str = start.to_string();
+            (status, v) = self
+                .send(
+                    Method::GET,
+                    "/rest/api/2/search",
+                    &[
+                        ("jql", jql),
+                        ("fields", views::PAGE_FIELDS),
+                        ("maxResults", limit.as_str()),
+                        ("startAt", start_str.as_str()),
+                    ],
+                    None,
+                )
+                .await?;
+            start_at = Some(start);
+        }
+        if !status.is_success() {
+            return Err(refusal("jira refused the search", status, &v));
+        }
+        let rows = v["issues"].as_array().cloned().unwrap_or_default();
+        let next_cursor = match start_at {
+            None if v["isLast"].as_bool() == Some(true) => None,
+            None => v["nextPageToken"].as_str().map(str::to_string),
+            Some(start) => {
+                let next = start + rows.len() as u64;
+                (!rows.is_empty() && v["total"].as_u64().is_some_and(|t| next < t))
+                    .then(|| next.to_string())
+            }
+        };
+        let email = match &self.cred.auth {
+            Auth::Basic { email, .. } => json!(email),
+            Auth::Bearer { .. } => Value::Null,
+        };
+        Ok(json!({
+            "site": site,
+            "account_email": email,
+            "issues": rows.iter().map(views::page_row).collect::<Vec<_>>(),
+            "next_cursor": next_cursor,
+        }))
+    }
+
     /// An issue as Jira returns it, with only `fields`.
     pub async fn get_issue(&self, key: &str, fields: &str) -> Result<Value, String> {
         self.expect(

@@ -313,3 +313,30 @@ async fn serve_will_not_start_without_the_contract_environment() {
         assert!(!socket.exists());
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_paged_search_and_a_markdown_comment_through_the_plugin() {
+    let fake = Fake::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut plugin = Plugin::start(dir.path()).await;
+
+    let args = json!({ "jql": "project = WRK", "page": true, "profile": "work" });
+    let ctx = signed("search", &args, None, lent(&fake));
+    let (error, v) = text(&plugin.call("search", args, Some(ctx)).await);
+    assert!(!error, "{v}");
+    assert_eq!(v["site"], fake.url.as_str());
+    assert_eq!(v["issues"].as_array().unwrap().len(), 3);
+    assert_eq!(v["next_cursor"], Value::Null);
+
+    let args = json!({ "key": "WRK-1", "body": "Done, **finally**.", "format": "markdown",
+                       "profile": "work" });
+    let ctx = signed("comment", &args, Some("apv-8"), lent(&fake));
+    let (error, v) = text(&plugin.call("comment", args, Some(ctx)).await);
+    assert!(!error, "{v}");
+    let writes = fake.writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(
+        writes[0].body,
+        json!({ "body": jira_review::wiki::from_markdown("Done, **finally**.") })
+    );
+}

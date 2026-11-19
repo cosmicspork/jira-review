@@ -102,7 +102,21 @@ An MCP server (protocol `2025-06-18`) on stdin/stdout:
 { "mcpServers": { "jira": { "command": "jira-review", "args": ["mcp"] } } }
 ```
 
-It serves `search`, `issue` and `transitions`, which answer at once. `update`, `transition`, `link`, `create` and `comment` store a proposal and return `{ "proposal_id", "status": "pending", "diff" }`. The extra tool `proposal_status { id, wait_secs ≤ 45 }` waits for a decision and reports `pending`, `approved` (with Jira's result), `rejected` (with the reviewer's reason), `stale` (the issue moved; propose again) or `failed` (Jira refused).
+It serves `search`, `issue` and `transitions`, which answer at once. `update`, `transition`, `link`, `create` and `comment` store a proposal and return `{ "proposal_id", "status": "pending", "diff" }`.
+
+`update`, `create` and `comment` take an optional `format`: `jira_wiki` (the default) or `markdown`. Markdown text (a `description`, on each of `issues` too, or a comment's `body`) is converted to wiki markup before proposing, so the proposal holds and shows what will be sent, as the CLI's `--markdown` does. `serve` takes the same argument.
+
+`search` pages when it is given `page: true` or a `cursor`, and `limit` may then go to 100 (100 unless you say). A page answers in the shape Tracon's `GET /api/jira/search` returns, so the node can pass it through unchanged:
+
+```json
+{ "site": "https://example.atlassian.net", "account_email": "me@example.com",
+  "issues": [ { "id": "10001", "key": "WRK-12", "summary": "Port the feed", "status": "To Do",
+                "status_category": "new", "priority": "Medium", "issue_type": "Task",
+                "labels": ["etl"], "parent": { "key": "WRK-10", "summary": "Feeds", "issue_type": "Epic" } } ],
+  "next_cursor": "…" }
+```
+
+`site` is the origin of `JIRA_URL`, and `account_email` is null for a Data Center PAT. `next_cursor` is Cloud's `nextPageToken`, or on Data Center, which only pages by offset, the next offset as a decimal string; it is null after the last page. Pass it back as `cursor` for the next page. A `search` without `page` or `cursor` answers its rows as before. The extra tool `proposal_status { id, wait_secs ≤ 45 }` waits for a decision and reports `pending`, `approved` (with Jira's result), `rejected` (with the reviewer's reason), `stale` (the issue moved; propose again) or `failed` (Jira refused).
 
 A person decides in a terminal:
 
@@ -187,6 +201,8 @@ jira-review wiki from-markdown notes.md
 **Verified** by `cargo test`, against a stateful fake Jira (an axum app on loopback):
 
 - each read, including the Data Center search fallback;
+- paged `search` on both: the page's shape, following `next_cursor` to the last page, the limit of 100, and a bad cursor refused;
+- Markdown input on `update`, `create` and `comment`, proposed and sent as wiki markup, and end to end through `serve`;
 - each write's propose → show → apply, with the exact requests sent;
 - assignee lookup (by email, name, account id and `me`; an ambiguous or unknown name refused) on both Cloud and Data Center, and due dates set and cleared;
 - a stale apply refused after the fake's `updated` moves, with nothing sent;
