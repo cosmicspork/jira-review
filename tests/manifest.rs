@@ -60,4 +60,8 @@ fn the_manifest_is_contract_1_and_versioned_with_the_crate() {
     assert_eq!(credential["name"].as_str(), Some("jira"));
     assert_eq!(credential["pattern"].as_str(), Some("jira-*"));
     assert!(credential.get("lend").is_none());
+    assert_eq!(
+        m["formats"].as_array().unwrap(),
+        &[toml::Value::from("jira_wiki")]
+    );
 }

@@ -114,6 +114,10 @@ async fn reads_answer_and_writes_wait_for_a_person() {
         .await;
 
     let list = mcp.request(2, "tools/list", json!({})).await;
+    assert_eq!(
+        support::formatted(list["result"]["tools"].as_array().unwrap()),
+        support::WIKI_FIELDS
+    );
     let names: Vec<&str> = list["result"]["tools"]
         .as_array()
         .unwrap()
@@ -134,6 +138,12 @@ async fn reads_answer_and_writes_wait_for_a_person() {
             "proposal_status"
         ]
     );
+
+    // Previews and conversions are Tracon's, answered only by `serve`.
+    for (id, method) in [(30, "tracon/preview"), (31, "tracon/format/convert")] {
+        let v = mcp.request(id, method, json!({})).await;
+        assert_eq!(v["error"]["code"], -32601, "{v}");
+    }
 
     let (error, issue) = mcp.tool(3, "issue", json!({ "key": "WRK-1" })).await;
     assert!(!error);

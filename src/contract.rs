@@ -4,9 +4,10 @@
 //! host: `params._meta.tracon` on each `tools/call` is an object holding
 //! `v`, `plugin`, `instance`, `tool`, `arguments_sha256`, `caller`,
 //! `channel`, `approval_id`, `issued_ms`, `expires_ms`, `nonce`,
-//! `credentials` and `signature`. The signature is ed25519 by the node key
-//! over the ASCII label `tracon/v1/plugin-call` followed by a big-endian u32
-//! length and the canonical JSON of the object without `signature`.
+//! `credentials` and `signature`, and optionally `preview_token`. The
+//! signature is ed25519 by the node key over the ASCII label
+//! `tracon/v1/plugin-call` followed by a big-endian u32 length and the
+//! canonical JSON of the object without `signature`.
 //! `tests/contract_vectors.json` pins every byte of it.
 
 use std::collections::HashMap;
@@ -181,6 +182,9 @@ pub struct Caller {
     pub harness: Option<String>,
     pub channel: String,
     pub approval_id: Option<String>,
+    /// The version token of the preview the operator approved, when there
+    /// was one.
+    pub preview_token: Option<String>,
     /// Credential name (`jira`, `jira-<profile>`) to its env-style fields.
     pub credentials: HashMap<String, HashMap<String, String>>,
 }
@@ -195,6 +199,7 @@ impl std::fmt::Debug for Caller {
             .field("harness", &self.harness)
             .field("channel", &self.channel)
             .field("approval_id", &self.approval_id)
+            .field("preview_token", &self.preview_token)
             .field("credentials", &lent)
             .finish()
     }
@@ -275,6 +280,7 @@ pub fn verify(
         return refuse(1, "caller context has no integer issued_ms and expires_ms");
     };
     let approval_id = opt_str(ctx.get("approval_id"), "approval_id")?;
+    let preview_token = opt_str(ctx.get("preview_token"), "preview_token")?;
     let caller = ctx.get("caller").and_then(Value::as_object);
     let Some(caller) = caller else {
         return refuse(1, "caller context has no caller");
@@ -376,6 +382,7 @@ pub fn verify(
         harness,
         channel: channel.to_string(),
         approval_id,
+        preview_token,
         credentials,
     })
 }
