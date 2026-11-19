@@ -135,11 +135,30 @@ Approving applies the change at once with the reviewer's own credential, running
 
 - credential `jira`, pattern `jira-*`. A tool's optional `profile` argument picks `jira-<profile>` instead of `jira`. Credentials are lent per call in the caller context, never read from the start environment, so a credential missing from a call means the call can't use it;
 - tools `search`, `issue`, `transitions` (read) and `update`, `transition`, `link`, `create`, `comment` (write; `transition` is `consequential`);
-- `egress = ["*.atlassian.net:443"]`. A Data Center host is whatever `JIRA_URL` names. The node shows egress on cards and does not enforce it.
+- `egress = ["*.atlassian.net:443"]`. A Data Center host is whatever `JIRA_URL` names. The node shows egress on cards and does not enforce it;
+- `formats = ["jira_wiki"]`: it owns the [`jira_wiki` format](#the-jira_wiki-format). In `tools/list` (from `mcp` too), the string properties that hold wiki markup carry `"x-tracon-format": "jira_wiki"`: `update.description`, `create.description`, `description` inside `create`'s `issues` items, and `comment.body`. The node's approval card shows them as prose, rendered through `tracon/format/convert`, and lists `create`'s `issues` as items.
 
-At start it requires `TRACON_PLUGIN_TOKEN` and `TRACON_NODE_KEY` (and `TRACON_CONTRACT=1` if set), and exits non-zero without them. `initialize`, `ping` and `tools/list` need no caller context. Every `tools/call` must carry a verified context. A write runs only when its context carries an `approval_id`, because the node's approval card is the review. It then proposes and applies in one step and records the change under `<data>/proposals/decided/`.
+At start it requires `TRACON_PLUGIN_TOKEN` and `TRACON_NODE_KEY` (and `TRACON_CONTRACT=1` if set), and exits non-zero without them. `initialize`, `ping`, `tools/list` and `tracon/format/convert` need no caller context. Every `tools/call` and `tracon/preview` must carry a verified context. A write runs only when its context carries an `approval_id`, because the node's approval card is the review. It then proposes and applies in one step and records the change under `<data>/proposals/decided/`.
 
-The seam for `tracon/preview` is `change::propose`, whose proposal is the preview and whose `versions` are the version token, and `change::apply(…, expected)`, which checks a token handed back. Until the node sends that token, an approved write in `serve` is checked against the issue as it is when the call arrives, so standalone mode is the only one that enforces staleness today.
+**`tracon/preview`** is sent when an approval card for one of its tools opens, with the call's `name`, `arguments` and a caller context checked as for a `tools/call` except that it needs no approval (checks 1–6). A write is proposed, and nothing is sent to Jira but reads:
+
+```json
+{ "previewable": true,
+  "summary": "update WRK-12 on https://example.atlassian.net",
+  "body": "```diff\nagainst WRK-12 as updated 2026-11-16T09:12:33.000+0000\n\nsummary:\n  - Port it\n  + Port the feed\n```\n",
+  "token": "{\"WRK-12\":\"2026-11-16T09:12:33.000+0000\"}" }
+```
+
+- `body` is Markdown: the diff `show` prints, without its header, in a code fence longer than any run of backticks inside it;
+- `token` is the proposal's `versions` as canonical JSON. The node keeps it with the approval and hands it back unread;
+- a read answers `previewable: false` with a `null` token, since there is nothing to show before it runs;
+- a write that would be refused (an unknown transition, a missing issue, a credential not lent) answers JSON-RPC error `-32003` with the reason, and the card shows it.
+
+The approved `tools/call` carries the token back as the context's `preview_token`. The write is applied against it rather than against a fresh read: if an issue it names has moved since the card was shown, nothing is sent, the change is recorded as stale, and the call is refused with JSON-RPC error `-32002` whose `data` is `{"stale": true}`, so the node can ask the agent to call again for a fresh card. An approved call without a token is checked against the issue as it is when the call arrives. Any stale refusal answers the same way.
+
+**`tracon/format/convert`** takes `{ "format": "jira_wiki", "to": "markdown" | "jira_wiki", "text": "…" }` and answers `{ "text": "…" }`, from wiki markup to Markdown or from Markdown to wiki markup. It is a pure function. Any other `format` or `to`, or a missing `text`, is a `-32602` error.
+
+`jira-review mcp` answers both methods with `-32601` (method not found).
 
 ### Caller context: wire format v1 (provisional, shared with sql-review and Tracon U3)
 
@@ -155,6 +174,7 @@ On each `tools/call`, `params._meta.tracon` is:
   "caller": { "kind": "operator" | "agent" | "plugin", "session": "<id or null>", "harness": "<id or null>" },
   "channel": "<channel>",
   "approval_id": "<id>" | null,
+  "preview_token": "<token from tracon/preview>",
   "issued_ms": 0,
   "expires_ms": 0,
   "nonce": "<32 lowercase hex chars>",
@@ -173,13 +193,14 @@ On each `tools/call`, `params._meta.tracon` is:
   5. `issued_ms − 5 s ≤ now ≤ expires_ms + 5 s`, and the window is at most 60 s;
   6. the nonce hasn't been seen;
   7. a write carries an `approval_id`.
+- `preview_token` is optional; absent and `null` mean the same. It is present only on a call dispatched from an approved card whose preview returned a token, and is signed like the rest, so no check changes for it.
 - `caller.kind = "plugin"` is reserved: it is accepted, but nothing sends it yet.
 
-[`tests/contract_vectors.json`](tests/contract_vectors.json) pins every byte: a fixed key, token and clock, a valid call with its signing bytes and signature, and one tampered case per check. Its `seed` is the **raw ed25519 secret key** (`SigningKey::from_bytes`), *not* a Tracon `Identity` seed, which derives its key through HKDF. sql-review should copy the file into its tests, and Tracon's plugin host should check its signer against it. `cargo test --test contract -- --ignored generate_contract_vectors` regenerates it deterministically.
+[`tests/contract_vectors.json`](tests/contract_vectors.json) pins every byte: a fixed key, token and clock, a valid call with its signing bytes and signature, the same call's context carrying a `preview_token` (`valid_preview_token`), and one tampered case per check. Its `seed` is the **raw ed25519 secret key** (`SigningKey::from_bytes`), *not* a Tracon `Identity` seed, which derives its key through HKDF. sql-review should copy the file into its tests, and Tracon's plugin host should check its signer against it. `cargo test --test contract -- --ignored generate_contract_vectors` regenerates it deterministically.
 
 ## The `jira_wiki` format
 
-This crate **owns the `jira_wiki` format**, conversion between Jira wiki markup and Markdown in both directions. A later unit will declare it in the manifest (and serve `tracon/format/convert`). Both directions are library functions and CLI subcommands:
+This crate **owns the `jira_wiki` format**, conversion between Jira wiki markup and Markdown in both directions. The manifest declares it and `serve` answers `tracon/format/convert` for it. Both directions are library functions and CLI subcommands:
 
 ```sh
 jira-review wiki to-markdown description.txt
@@ -211,6 +232,9 @@ jira-review wiki from-markdown notes.md
 - credential precedence (environment, then `.env`, then keyring);
 - `mcp` over stdio with the proposal flow across processes (approve, reject, stale);
 - `serve` over a Unix socket with signed contexts, each refusal and an approved write;
+- `tracon/preview`: a write's diff and token with nothing sent, a read's `previewable: false`, a write that would be refused, and a preview whose context does not verify; the approved call applying against the token, and refused as stale (`data.stale`) with nothing sent once the issue moved;
+- `tracon/format/convert` both ways, and its `-32602` refusals;
+- the `x-tracon-format` markers in `tools/list`, from `serve` and `mcp`;
 - the manifest against `tools/list`;
 - the contract vectors.
 
@@ -221,7 +245,8 @@ jira-review wiki from-markdown notes.md
 - assignee lookup against a real Jira: the fake matches users the way the REST docs describe `user/assignable/search`, and a real site's matching may differ;
 - the keyring backends (`login`, `logout`, keyring reads). Only the secret format is tested;
 - the release workflow, until the first tag, including the aarch64 Linux cross build;
-- the caller-context format, which stays provisional until Tracon's plugin host (U3) signs against the vectors.
+- the caller-context format, which stays provisional until Tracon's plugin host (U3) signs against the vectors;
+- `tracon/preview`, `preview_token` and `tracon/format/convert` against a real node, until Tracon's U6 and U8 send them.
 
 ## Development
 

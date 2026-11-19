@@ -5,6 +5,8 @@ exec = ["bin/jira-review", "serve"]
 # A Jira Cloud site; a Data Center host is whatever JIRA_URL names. Shown on
 # cards, not enforced.
 egress = ["*.atlassian.net:443"]
+# Jira wiki markup, converted to and from Markdown by tracon/format/convert.
+formats = ["jira_wiki"]
 
 # Lent per call as `jira`, or `jira-<profile>` for a tool call's `profile`.
 # Fields: JIRA_URL with JIRA_EMAIL and JIRA_TOKEN (Cloud), or JIRA_PAT (Data

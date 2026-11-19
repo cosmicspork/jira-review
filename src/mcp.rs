@@ -1,9 +1,9 @@
 //! A small MCP server: JSON-RPC 2.0 with `initialize`, `ping`, `tools/list`
 //! and `tools/call`, independent of transport. `stdio` carries it as lines
 //! for any MCP client; `serve` carries it over HTTP on a Unix socket for
-//! Tracon. What a tool call does is the [`Host`]'s: `Standalone` proposes
-//! writes for a person to review, `Plugin` applies them only with the
-//! node's approval.
+//! Tracon, which also sends `tracon/preview` and `tracon/format/convert`.
+//! What a call does is the [`Host`]'s: `Standalone` proposes writes for a
+//! person to review, `Plugin` applies them only with the node's approval.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::auth::{self, Credential};
-use crate::change::{self, Kind, Outcome, Render};
-use crate::contract::{self, CallId, ContractEnv, NonceCache};
+use crate::change::{self, ApplyError, Kind, Outcome, Proposal, Render, Versions};
+use crate::contract::{self, CallId, Caller, ContractEnv, NonceCache};
 use crate::jira::Jira;
 use crate::store::{Place, Store};
 
@@ -58,6 +58,20 @@ pub trait Host: Send + Sync {
         arguments: Option<&Value>,
         meta: Option<&Value>,
     ) -> impl Future<Output = Result<Value, RpcError>> + Send;
+
+    /// A `tracon/preview`: what a tool call would do, without doing it.
+    fn preview(&self, _params: &Value) -> impl Future<Output = Result<Value, RpcError>> + Send {
+        async { Err(no_method("tracon/preview")) }
+    }
+
+    /// A `tracon/format/convert`.
+    fn convert(&self, _params: &Value) -> Result<Value, RpcError> {
+        Err(no_method("tracon/format/convert"))
+    }
+}
+
+fn no_method(method: &str) -> RpcError {
+    RpcError::new(-32601, format!("no method {method}"))
 }
 
 /// A tool's answer.
@@ -122,7 +136,9 @@ pub async fn handle<H: Host>(host: &H, msg: Value) -> Option<Value> {
                 host.call(name, params.get("arguments"), meta).await
             }
         },
-        other => Err(RpcError::new(-32601, format!("no method {other}"))),
+        "tracon/preview" => host.preview(&params).await,
+        "tracon/format/convert" => host.convert(&params),
+        other => Err(no_method(other)),
     };
     Some(match result {
         Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
@@ -132,6 +148,12 @@ pub async fn handle<H: Host>(host: &H, msg: Value) -> Option<Value> {
 
 fn string(description: &str) -> Value {
     json!({ "type": "string", "description": description })
+}
+
+/// A string in the `jira_wiki` format, marked so that Tracon's card renders
+/// it through `tracon/format/convert`.
+fn wiki(description: &str) -> Value {
+    json!({ "type": "string", "description": description, "x-tracon-format": "jira_wiki" })
 }
 
 fn nullable(description: &str) -> Value {
@@ -155,7 +177,7 @@ pub fn definitions(profile: bool, write_note: &str) -> Vec<Value> {
         "project": string("Project key, e.g. WRK."),
         "type": string("Issue type name, e.g. Task."),
         "summary": { "type": "string" },
-        "description": string("Jira wiki markup, or Markdown with format markdown."),
+        "description": wiki("Jira wiki markup, or Markdown with format markdown."),
         "priority": string("Priority name, e.g. High."),
         "assignee": nullable("Who to assign it: account id, username, email, display name, or \
                               \"me\"."),
@@ -232,7 +254,7 @@ pub fn definitions(profile: bool, write_note: &str) -> Vec<Value> {
             "inputSchema": { "type": "object", "properties": {
                 "key": key,
                 "summary": { "type": "string" },
-                "description": string("Jira wiki markup, or Markdown with format markdown."),
+                "description": wiki("Jira wiki markup, or Markdown with format markdown."),
                 "format": format.clone(),
                 "priority": string("Priority name, e.g. High."),
                 "assignee": nullable("Who to assign it: account id, username, email, display \
@@ -296,7 +318,7 @@ pub fn definitions(profile: bool, write_note: &str) -> Vec<Value> {
             ),
             "inputSchema": { "type": "object", "properties": {
                 "key": key,
-                "body": string("Jira wiki markup, or Markdown with format markdown."),
+                "body": wiki("Jira wiki markup, or Markdown with format markdown."),
                 "format": format,
             }, "required": ["key", "body"] },
             "annotations": write(false),
@@ -483,6 +505,11 @@ const PLUGIN_WRITE: &str = "Applied only once the operator has approved this cal
 
 /// Code for a call refused by its caller context.
 pub const REFUSED: i64 = -32001;
+/// Code for an approved write refused because an issue moved since its
+/// preview; its `data` is `{"stale": true}`.
+pub const STALE: i64 = -32002;
+/// Code for a preview that could not be taken: the write would be refused.
+pub const NOT_PREVIEWED: i64 = -32003;
 
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -490,44 +517,132 @@ fn now_ms() -> i64 {
         .map_or(0, |d| d.as_millis() as i64)
 }
 
+/// The Jira a call's `profile` picks among the credentials lent to it, and
+/// its arguments without `profile`.
+fn lent_jira(
+    args: &Value,
+    lent: &HashMap<String, HashMap<String, String>>,
+) -> Result<(Value, Jira), String> {
+    let mut args = args.clone();
+    let profile = match args.as_object_mut().and_then(|o| o.remove("profile")) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(p)) if !p.trim().is_empty() => Some(p.trim().to_string()),
+        Some(_) => return Err("profile expects a non-empty string".into()),
+    };
+    let wanted = auth::lent_name(profile.as_deref());
+    let fields = lent
+        .get(&wanted)
+        .ok_or_else(|| format!("credential {wanted} was not lent to this call"))?;
+    let jira = Jira::new(Credential::from_map(
+        fields,
+        &format!("credential {wanted}"),
+    )?);
+    Ok((args, jira))
+}
+
+/// A proposal as `tracon/preview` answers it: its diff as Markdown, and its
+/// `versions` as the token an approved call hands back.
+pub fn preview_of(p: &Proposal) -> Value {
+    let diff = change::changes(p, Render::default());
+    let longest = diff.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest.max(2) + 1);
+    json!({
+        "previewable": true,
+        "summary": change::title(p),
+        "body": format!("{fence}diff\n{diff}{fence}\n"),
+        "token": contract::canonical(&json!(p.versions)),
+    })
+}
+
+/// `tracon/format/convert` for `jira_wiki`, the format this plugin owns.
+pub fn convert(params: &Value) -> Result<Value, RpcError> {
+    let bad = |m: String| RpcError::new(-32602, m);
+    match params["format"].as_str() {
+        Some("jira_wiki") => {}
+        Some(other) => return Err(bad(format!("format {other} is not jira_wiki"))),
+        None => return Err(bad("tracon/format/convert needs a format".into())),
+    }
+    let text = params["text"]
+        .as_str()
+        .ok_or_else(|| bad("tracon/format/convert needs text".into()))?;
+    let text = match params["to"].as_str() {
+        Some("markdown") => crate::wiki::to_markdown(text),
+        Some("jira_wiki") => crate::wiki::from_markdown(text),
+        Some(other) => return Err(bad(format!("to {other} is not markdown or jira_wiki"))),
+        None => return Err(bad("tracon/format/convert needs to".into())),
+    };
+    Ok(json!({ "text": text }))
+}
+
 impl Plugin {
-    async fn run(
+    /// Check the caller context of a call or a preview of `name`.
+    fn verify(
         &self,
         name: &str,
-        args: &Value,
-        lent: &HashMap<String, HashMap<String, String>>,
-    ) -> Result<Value, String> {
-        let mut args = args.clone();
-        let profile = match args.as_object_mut().and_then(|o| o.remove("profile")) {
-            None | Some(Value::Null) => None,
-            Some(Value::String(p)) if !p.trim().is_empty() => Some(p.trim().to_string()),
-            Some(_) => return Err("profile expects a non-empty string".into()),
+        arguments: Option<&Value>,
+        meta: Option<&Value>,
+        write: bool,
+    ) -> Result<Caller, RpcError> {
+        if !READS.contains(&name) && !is_write(name) {
+            return Err(unknown(name));
+        }
+        let context = meta.map_or(&Value::Null, |m| &m["tracon"]);
+        let call = CallId {
+            tool: name,
+            arguments,
+            write,
         };
-        let wanted = auth::lent_name(profile.as_deref());
-        let fields = lent
-            .get(&wanted)
-            .ok_or_else(|| format!("credential {wanted} was not lent to this call"))?;
-        let jira = Jira::new(Credential::from_map(
-            fields,
-            &format!("credential {wanted}"),
-        )?);
+        contract::verify(context, &call, &self.env, now_ms(), &self.nonces).map_err(|r| RpcError {
+            code: REFUSED,
+            message: format!("refused: {}", r.reason),
+            data: Some(json!({ "check": r.check })),
+        })
+    }
+
+    async fn run(&self, name: &str, args: &Value, caller: &Caller) -> Result<Value, RpcError> {
+        let answer = |r: Result<Value, String>| match r {
+            Ok(v) => tool_ok(&v),
+            Err(e) => tool_error(&e),
+        };
+        let (args, jira) = match lent_jira(args, &caller.credentials) {
+            Ok(lent) => lent,
+            Err(e) => return Ok(tool_error(&e)),
+        };
         let Some(kind) = Kind::parse(name) else {
-            return read(name, &args, &jira).await;
+            return Ok(answer(read(name, &args, &jira).await));
         };
-        // The node's card was the review: propose and apply in one step.
-        let mut p = change::propose(kind, &args, &jira).await?;
-        // TODO(U6): once `tracon/preview` hands the proposal's `versions` to
-        // the node as its version token, the approved call carries it back
-        // and this becomes `apply(&p, &jira, Some(&token))`, so a change that
-        // moved since the card was shown is refused here too.
-        let applied = change::apply(&p, &jira, None).await;
+        let expected: Option<Versions> = match &caller.preview_token {
+            None => None,
+            Some(token) => Some(serde_json::from_str(token).map_err(|_| {
+                RpcError::new(
+                    -32602,
+                    "preview_token is not a version token from this plugin",
+                )
+            })?),
+        };
+        // The node's card was the review: propose and apply in one step,
+        // against the versions the card showed when it had a preview.
+        let mut p = match change::propose(kind, &args, &jira).await {
+            Ok(p) => p,
+            Err(e) => return Ok(tool_error(&e)),
+        };
+        let applied = change::apply(&p, &jira, expected.as_ref()).await;
         p.outcome = Some(Outcome::of(applied.clone()));
         if let Err(e) = self.store.record(&p) {
             eprintln!("jira-review: could not record {}: {e}", p.id);
         }
-        applied
-            .map(|result| json!({ "proposal_id": p.id, "result": result }))
-            .map_err(|e| e.to_string())
+        match applied {
+            Err(e @ ApplyError::Stale { .. }) => Err(RpcError {
+                code: STALE,
+                message: e.to_string(),
+                data: Some(json!({ "stale": true })),
+            }),
+            applied => Ok(answer(
+                applied
+                    .map(|result| json!({ "proposal_id": p.id, "result": result }))
+                    .map_err(|e| e.to_string()),
+            )),
+        }
     }
 }
 
@@ -542,32 +657,37 @@ impl Host for Plugin {
         arguments: Option<&Value>,
         meta: Option<&Value>,
     ) -> Result<Value, RpcError> {
-        if !READS.contains(&name) && !is_write(name) {
-            return Err(unknown(name));
-        }
-        let context = meta.map_or(&Value::Null, |m| &m["tracon"]);
-        let call = CallId {
-            tool: name,
-            arguments,
-            write: is_write(name),
-        };
-        let caller =
-            contract::verify(context, &call, &self.env, now_ms(), &self.nonces).map_err(|r| {
-                RpcError {
-                    code: REFUSED,
-                    message: format!("refused: {}", r.reason),
-                    data: Some(json!({ "check": r.check })),
-                }
-            })?;
+        let caller = self.verify(name, arguments, meta, is_write(name))?;
         let empty = json!({});
-        Ok(
-            match self
-                .run(name, arguments.unwrap_or(&empty), &caller.credentials)
-                .await
-            {
-                Ok(v) => tool_ok(&v),
-                Err(e) => tool_error(&e),
-            },
-        )
+        self.run(name, arguments.unwrap_or(&empty), &caller).await
+    }
+
+    /// Checks 1 to 6 of the caller context, as for a call; a preview needs
+    /// no approval. Nothing is sent to Jira but reads.
+    async fn preview(&self, params: &Value) -> Result<Value, RpcError> {
+        let name = params["name"]
+            .as_str()
+            .ok_or_else(|| RpcError::new(-32602, "tracon/preview needs a tool name"))?;
+        let arguments = params.get("arguments");
+        let meta = params.get("_meta").filter(|m| !m.is_null());
+        let caller = self.verify(name, arguments, meta, false)?;
+        let Some(kind) = Kind::parse(name) else {
+            return Ok(json!({
+                "previewable": false,
+                "summary": format!("{name} only reads"),
+                "body": format!("`{name}` reads from Jira and changes nothing."),
+                "token": null,
+            }));
+        };
+        let empty = json!({});
+        let refused = |e: String| RpcError::new(NOT_PREVIEWED, e);
+        let (args, jira) =
+            lent_jira(arguments.unwrap_or(&empty), &caller.credentials).map_err(refused)?;
+        let p = change::propose(kind, &args, &jira).await.map_err(refused)?;
+        Ok(preview_of(&p))
+    }
+
+    fn convert(&self, params: &Value) -> Result<Value, RpcError> {
+        convert(params)
     }
 }

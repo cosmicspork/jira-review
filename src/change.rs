@@ -199,10 +199,9 @@ pub fn now() -> String {
 /// without sending anything. Markdown given with `format: "markdown"` is
 /// converted first, so the proposal's `args` hold the wiki markup it sends.
 ///
-/// This is the seam for Tracon's `tracon/preview`: the proposal is the
-/// preview's answer and its `versions` the version token the node hands back
-/// with an approved call, for [`apply`]'s `expected`. That method is not
-/// built yet.
+/// This is also Tracon's `tracon/preview`: the proposal is the preview's
+/// answer and its `versions` the version token the node hands back with an
+/// approved call, for [`apply`]'s `expected`.
 pub async fn propose(kind: Kind, args: &Value, jira: &Jira) -> Result<Proposal, String> {
     let converted;
     let args = match kind {
@@ -877,6 +876,29 @@ pub fn render(p: &Proposal, opts: Render) -> String {
         s: String::new(),
         color: opts.color,
     };
+    out.painted("1", &title(p));
+    out.line(&format!("id {}, proposed {}", p.id, p.created));
+    render_changes(&mut out, p, opts);
+    out.s
+}
+
+/// What a change is, in one line: its kind, subject and site.
+pub fn title(p: &Proposal) -> String {
+    format!("{} {} on {}", p.kind.name(), p.subject(), p.jira)
+}
+
+/// [`render`] without the header: what the change depends on and each field
+/// it changes.
+pub fn changes(p: &Proposal, opts: Render) -> String {
+    let mut out = Out {
+        s: String::new(),
+        color: opts.color,
+    };
+    render_changes(&mut out, p, opts);
+    out.s
+}
+
+fn render_changes(out: &mut Out, p: &Proposal, opts: Render) {
     let wiki = |v: &Value| -> String {
         let s = v.as_str().unwrap_or_default();
         if opts.markdown {
@@ -885,11 +907,6 @@ pub fn render(p: &Proposal, opts: Render) -> String {
             s.to_string()
         }
     };
-    out.painted(
-        "1",
-        &format!("{} {} on {}", p.kind.name(), p.subject(), p.jira),
-    );
-    out.line(&format!("id {}, proposed {}", p.id, p.created));
     if p.versions.is_empty() {
         out.line("depends on no existing issue");
     }
@@ -919,7 +936,7 @@ pub fn render(p: &Proposal, opts: Render) -> String {
                         }
                     }
                     "summary" | "description" => {
-                        text_diff(&mut out, &wiki(&cur[field]), &wiki(&new[field]))
+                        text_diff(out, &wiki(&cur[field]), &wiki(&new[field]))
                     }
                     _ => {
                         out.removed(&scalar(&cur[field]));
@@ -1015,7 +1032,6 @@ pub fn render(p: &Proposal, opts: Render) -> String {
             }
         }
     }
-    out.s
 }
 
 #[cfg(test)]
