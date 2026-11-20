@@ -2,9 +2,9 @@ name = "jira-review"
 version = "0.2.0"
 contract = 1
 exec = ["bin/jira-review", "serve"]
-# A Jira Cloud site; a Data Center host is whatever JIRA_URL names. Shown on
-# cards, not enforced.
-egress = ["*.atlassian.net:443"]
+# No egress listed: the host is whatever JIRA_URL names (a Jira Cloud site or
+# a Data Center host), so no fixed entry would be true. Tracon nodes before
+# the release that accepts `*.domain` entries refuse a wildcard here.
 # Jira wiki markup, converted to and from Markdown by tracon/format/convert.
 formats = ["jira_wiki"]
 
