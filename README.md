@@ -256,4 +256,8 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
+## Releases
+
+Releases are cut with [release-please](https://github.com/googleapis/release-please). Each merge to `main` updates a release PR that bumps the version in `Cargo.toml`, `Cargo.lock` and `tracon-plugin.toml` together and writes `CHANGELOG.md` from the conventional-commit PR titles (`feat` bumps the minor version, `fix` the patch, and before 1.0 a breaking change bumps the minor). Merging the release PR tags `v<version>`, creates the GitHub release, and the release workflow attaches `jira-review-<version>-<target>.tar.gz` for each target with `checksums.txt` and build provenance attestations.
+
 MIT licensed; see [LICENSE](LICENSE).
