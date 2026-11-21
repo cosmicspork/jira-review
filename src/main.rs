@@ -170,8 +170,15 @@ enum Command {
     Apply { change: String },
     /// Approve or reject the proposals `mcp` is waiting on.
     Review {
-        #[arg(long, conflicts_with_all = ["approve", "reject"])]
+        #[arg(long, conflicts_with_all = ["approve", "reject", "web"])]
         list: bool,
+        /// Review on a page served to this machine only, in place of the
+        /// terminal. Prints the address to open.
+        #[arg(long, conflicts_with_all = ["approve", "reject"])]
+        web: bool,
+        /// The port for --web; a free one unless given.
+        #[arg(long, requires = "web", default_value_t = 0)]
+        port: u16,
         #[arg(long, conflicts_with = "reject")]
         approve: Option<String>,
         #[arg(long)]
@@ -605,6 +612,8 @@ async fn run(cli: Cli) -> Result<(), Fail> {
         }
         Command::Review {
             list,
+            web,
+            port,
             approve,
             reject,
             reason,
@@ -621,6 +630,8 @@ async fn run(cli: Cli) -> Result<(), Fail> {
             } else if let Some(id) = reject {
                 let done = review::reject(&store, id, reason.clone())?;
                 print!("{}", review::describe(&done));
+            } else if *web {
+                jira_review::web::run(store, jira()?, *markdown, *port).await?;
             } else {
                 let render = Render {
                     color: color(*no_color),

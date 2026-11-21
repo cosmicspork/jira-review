@@ -15,4 +15,5 @@ pub mod serve;
 pub mod stdio;
 pub mod store;
 pub mod views;
+pub mod web;
 pub mod wiki;

@@ -810,35 +810,77 @@ pub struct Render {
     pub markdown: bool,
 }
 
+/// What a line of a rendered change is, so each surface can mark it its
+/// own way: ANSI colour in a terminal, a class on the review page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    /// The change's one-line title.
+    Title,
+    /// A field name, a note, or a blank line.
+    Plain,
+    /// What goes.
+    Removed,
+    /// What comes.
+    Added,
+    /// What stays, shown around a change.
+    Context,
+}
+
+/// One line of a rendered change, without its marker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Line {
+    pub tone: Tone,
+    pub text: String,
+}
+
+#[derive(Default)]
 struct Out {
-    s: String,
-    color: bool,
+    lines: Vec<Line>,
 }
 
 impl Out {
-    fn line(&mut self, text: &str) {
-        self.s.push_str(text);
-        self.s.push('\n');
+    fn push(&mut self, tone: Tone, text: &str) {
+        self.lines.push(Line {
+            tone,
+            text: text.to_string(),
+        });
     }
 
-    fn painted(&mut self, code: &str, text: &str) {
-        if self.color {
-            self.s.push_str(&format!("\x1b[{code}m{text}\x1b[0m\n"));
-        } else {
-            self.line(text);
-        }
+    fn line(&mut self, text: &str) {
+        self.push(Tone::Plain, text);
     }
 
     fn removed(&mut self, text: &str) {
-        self.painted("31", &format!("  - {text}"));
+        self.push(Tone::Removed, text);
     }
 
     fn added(&mut self, text: &str) {
-        self.painted("32", &format!("  + {text}"));
+        self.push(Tone::Added, text);
     }
 
     fn context(&mut self, text: &str) {
-        self.line(&format!("    {text}"));
+        self.push(Tone::Context, text);
+    }
+
+    /// The lines as text, with `-`/`+` markers and, when asked, colour.
+    fn text(&self, color: bool) -> String {
+        let mut s = String::new();
+        for Line { tone, text } in &self.lines {
+            let (code, text) = match tone {
+                Tone::Title => ("1", text.clone()),
+                Tone::Plain => ("", text.clone()),
+                Tone::Removed => ("31", format!("  - {text}")),
+                Tone::Added => ("32", format!("  + {text}")),
+                Tone::Context => ("", format!("    {text}")),
+            };
+            if color && !code.is_empty() {
+                s.push_str(&format!("\x1b[{code}m{text}\x1b[0m\n"));
+            } else {
+                s.push_str(&text);
+                s.push('\n');
+            }
+        }
+        s
     }
 }
 
@@ -872,14 +914,11 @@ fn text_diff(out: &mut Out, old: &str, new: &str) {
 
 /// Render a change for a reviewer: a header, then each field it changes.
 pub fn render(p: &Proposal, opts: Render) -> String {
-    let mut out = Out {
-        s: String::new(),
-        color: opts.color,
-    };
-    out.painted("1", &title(p));
+    let mut out = Out::default();
+    out.push(Tone::Title, &title(p));
     out.line(&format!("id {}, proposed {}", p.id, p.created));
     render_changes(&mut out, p, opts);
-    out.s
+    out.text(opts.color)
 }
 
 /// What a change is, in one line: its kind, subject and site.
@@ -890,12 +929,17 @@ pub fn title(p: &Proposal) -> String {
 /// [`render`] without the header: what the change depends on and each field
 /// it changes.
 pub fn changes(p: &Proposal, opts: Render) -> String {
-    let mut out = Out {
-        s: String::new(),
-        color: opts.color,
-    };
+    let mut out = Out::default();
     render_changes(&mut out, p, opts);
-    out.s
+    out.text(opts.color)
+}
+
+/// [`changes`] as lines with their tone and no markers, for a surface that
+/// marks them itself. `opts.color` is ignored.
+pub fn change_lines(p: &Proposal, opts: Render) -> Vec<Line> {
+    let mut out = Out::default();
+    render_changes(&mut out, p, opts);
+    out.lines
 }
 
 fn render_changes(out: &mut Out, p: &Proposal, opts: Render) {
