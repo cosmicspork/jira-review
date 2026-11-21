@@ -13,7 +13,7 @@ use serde_json::{Map, Value, json};
 
 use crate::args::{self, LinkType, NewIssue};
 use crate::jira::Jira;
-use crate::views;
+use crate::{route, views};
 
 /// The change file format this build reads and writes.
 pub const FORMAT: u32 = 1;
@@ -386,6 +386,9 @@ async fn propose_update(args: &Value, jira: &Jira) -> Result<Proposed, String> {
 }
 
 async fn propose_transition(args: &Value, jira: &Jira) -> Result<Proposed, String> {
+    if route::is_route(args)? {
+        return route::propose(args, jira).await;
+    }
     args::only(args, "transition", &["key", "transition", "fields"])?;
     let key = args::issue_key(args.get("key"), "key")?;
     let asked = args::transition_arg(args)?;
@@ -397,104 +400,8 @@ async fn propose_transition(args: &Value, jira: &Jira) -> Result<Proposed, Strin
     let raw = jira.transitions_raw(key).await?;
     let issue = jira.get_issue(key, "status,updated").await?;
     let versions = Versions::from([version_of(key, &issue)?]);
-    let offered: Vec<&Value> = raw["transitions"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .collect();
-    let listing = || {
-        let names: Vec<String> = offered
-            .iter()
-            .map(|t| {
-                format!(
-                    "{} {} (to {})",
-                    t["id"].as_str().unwrap_or("?"),
-                    t["name"].as_str().unwrap_or("?"),
-                    t["to"]["name"].as_str().unwrap_or("?")
-                )
-            })
-            .collect();
-        if names.is_empty() {
-            "none".to_string()
-        } else {
-            names.join(", ")
-        }
-    };
-    let by_id: Vec<&&Value> = offered
-        .iter()
-        .filter(|t| t["id"].as_str() == Some(asked))
-        .collect();
-    let found: Vec<&&Value> = if by_id.is_empty() {
-        offered
-            .iter()
-            .filter(|t| {
-                [&t["name"], &t["to"]["name"]]
-                    .into_iter()
-                    .filter_map(Value::as_str)
-                    .any(|n| n.trim().eq_ignore_ascii_case(asked))
-            })
-            .collect()
-    } else {
-        by_id
-    };
-    let t = match found.as_slice() {
-        [t] => **t,
-        [] => {
-            return Err(format!(
-                "{key} offers no transition {asked:?} from where it is now; it offers {}",
-                listing()
-            ));
-        }
-        _ => {
-            return Err(format!(
-                "{asked:?} names more than one of {key}'s transitions; name one by id: {}",
-                listing()
-            ));
-        }
-    };
-    let name = t["name"].as_str().unwrap_or_default();
-    let takes: Vec<&String> = t["fields"]
-        .as_object()
-        .into_iter()
-        .flatten()
-        .map(|(k, _)| k)
-        .collect();
-    if let Some(extra) = given.keys().find(|k| !takes.contains(k)) {
-        let takes = if takes.is_empty() {
-            "none".to_string()
-        } else {
-            takes
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        return Err(format!(
-            "transition {name} does not take field {extra}; it takes {takes}"
-        ));
-    }
-    let missing: Vec<String> = views::required_fields(t)
-        .into_iter()
-        .filter(|f| !f["id"].as_str().is_some_and(|id| given.contains_key(id)))
-        .map(|f| {
-            let id = f["id"].as_str().unwrap_or_default();
-            let mut s = format!("{id} ({})", f["name"].as_str().unwrap_or(id));
-            if let Some(allowed) = f["allowed"].as_array() {
-                let names: Vec<String> = allowed
-                    .iter()
-                    .map(|a| a.as_str().map_or(a.to_string(), str::to_string))
-                    .collect();
-                s.push_str(&format!(": one of {}", names.join(", ")));
-            }
-            s
-        })
-        .collect();
-    if !missing.is_empty() {
-        return Err(format!(
-            "transition {name} requires {}; pass them in fields",
-            missing.join("; ")
-        ));
-    }
+    let t = route::pick(&raw, asked, key)?;
+    route::check_fields(t, &given)?;
     let current = json!({ "status": issue["fields"]["status"]["name"] });
     let mut proposed = json!({
         "status": t["to"]["name"],
@@ -662,6 +569,7 @@ pub async fn apply(
     let a = &p.args;
     match p.kind {
         Kind::Update => update_body(p).map(drop),
+        Kind::Transition if is_route(p) => route::validate(p),
         Kind::Transition => args::issue_key(a.get("key"), "key")
             .and_then(|_| args::transition_arg(a))
             .map(drop),
@@ -704,6 +612,7 @@ pub async fn apply(
             }
             Ok(v)
         }
+        Kind::Transition if is_route(p) => route::apply(p, jira).await,
         Kind::Transition => {
             let key = args::issue_key(a.get("key"), "key").map_err(Invalid)?;
             let id = p.proposed["transition"]["id"]
@@ -755,6 +664,12 @@ pub async fn apply(
             jira.comment(key, body).await.map_err(Refused)
         }
     }
+}
+
+/// Whether a transition change takes a route of several hops rather than
+/// one transition.
+pub fn is_route(p: &Proposal) -> bool {
+    p.kind == Kind::Transition && p.proposed.get("hops").is_some()
 }
 
 /// Create a planned set in order, each `#N` parent made the key item N was
@@ -996,6 +911,7 @@ fn render_changes(out: &mut Out, p: &Proposal, opts: Render) {
                 ));
             }
         }
+        Kind::Transition if is_route(p) => render_route(out, p),
         Kind::Transition => {
             out.line("status:");
             out.removed(&scalar(&cur["status"]));
@@ -1076,6 +992,74 @@ fn render_changes(out: &mut Out, p: &Proposal, opts: Render) {
             }
         }
     }
+}
+
+/// A route: where the issue is and where it ends up, then each hop in order
+/// with what it takes.
+fn render_route(out: &mut Out, p: &Proposal) {
+    let new = &p.proposed;
+    let hops = new["hops"].as_array().cloned().unwrap_or_default();
+    let unknown = |v: &Value, asked: &Value| match v {
+        Value::Null => format!("(where {:?} leads)", asked.as_str().unwrap_or("?")),
+        other => scalar(other),
+    };
+    out.line("status:");
+    out.removed(&scalar(&p.current["status"]));
+    let last = hops.last().cloned().unwrap_or(Value::Null);
+    out.added(&unknown(&new["status"], &last["asked"]));
+    let how = match (new["route"].as_str(), new["workflow"].as_str()) {
+        (Some("workflow"), Some(w)) => format!(
+            "the shortest route in workflow {w} that starts with a transition the issue offers \
+             now"
+        ),
+        (Some("offered"), _) => "a transition the issue offers now".into(),
+        (_, Some(w)) => format!("the path given, checked against workflow {w}"),
+        _ => "the path given; the workflow could not be read, so each hop after the first is \
+              checked only when the issue reaches it"
+            .into(),
+    };
+    let n = hops.len();
+    out.line(&format!(
+        "by {n} transition{}, in order ({how}):",
+        if n == 1 { "" } else { "s" }
+    ));
+    for (i, h) in hops.iter().enumerate() {
+        let step = match h["transition"].as_object() {
+            Some(t) => format!(
+                "{} -> {} by {} ({})",
+                scalar(&h["from"]),
+                scalar(&h["to"]),
+                scalar(&t["id"]),
+                scalar(&t["name"])
+            ),
+            None => format!(
+                "{} {:?}, as the issue offers it then",
+                match h["from"].as_str() {
+                    Some(from) => format!("from {from} by"),
+                    None => "then by".into(),
+                },
+                h["asked"].as_str().unwrap_or("?")
+            ),
+        };
+        out.line(&format!("  {}. {step}", i + 1));
+        match h["required_fields"].as_array() {
+            Some(r) if r.is_empty() => {}
+            Some(r) => {
+                let names: Vec<String> = r.iter().map(route::describe_field).collect();
+                out.line(&format!("     requires {}", names.join("; ")));
+            }
+            None => out.line("     its required fields are known only once the issue gets there"),
+        }
+        if let Some(fields) = h["fields"].as_object() {
+            for (k, v) in fields {
+                out.added(&format!("   {k}: {v}"));
+            }
+        }
+    }
+    out.line(
+        "each hop is checked again just before it is sent; one that cannot be sent stops the \
+         route there, and the hops before it stay applied",
+    );
 }
 
 #[cfg(test)]

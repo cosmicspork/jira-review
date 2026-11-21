@@ -552,3 +552,57 @@ async fn a_paged_search_and_a_markdown_comment_through_the_plugin() {
         json!({ "body": jira_review::wiki::from_markdown("Done, **finally**.") })
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_route_is_applied_only_along_the_route_its_card_showed() {
+    let fake = Fake::start().await;
+    fake.strict_workflow();
+    let dir = tempfile::tempdir().unwrap();
+    let mut plugin = Plugin::start(dir.path()).await;
+    let args = json!({ "key": "WRK-1", "to_status": "UAT", "profile": "work" });
+
+    let v = preview(&mut plugin, &fake, "transition", &args).await;
+    let body = v["result"]["body"].as_str().unwrap();
+    for line in [
+        "  1. To Do -> Requirements Gathering by 11 (Gather)\n",
+        "  2. Requirements Gathering -> In Progress by 21 (Start)\n",
+        "  3. In Progress -> UAT by 31 (Test)\n",
+    ] {
+        assert!(body.contains(line), "{line:?} not in\n{body}");
+    }
+    let token = v["result"]["token"].clone();
+    let shown: Value = serde_json::from_str(token.as_str().unwrap()).unwrap();
+    assert_eq!(shown["route"][0], json!(["10001", "11", "10004"]));
+    assert!(fake.writes().is_empty());
+
+    // The workflow gains a shortcut while the card waits: the issue has not
+    // moved, but the route found now is not the one approved.
+    fake.add_transition("23", "Fast track", &["To Do"], "In Progress");
+    let ctx = approved_with("transition", &args, &token, &fake);
+    let v = plugin.call("transition", args.clone(), Some(ctx)).await;
+    assert_eq!(v["error"]["code"], -32002, "{v}");
+    assert_eq!(v["error"]["data"], json!({ "stale": true }));
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not the one its card showed"),
+        "{v}"
+    );
+    assert!(fake.writes().is_empty());
+
+    let v = preview(&mut plugin, &fake, "transition", &args).await;
+    let token = v["result"]["token"].clone();
+    let ctx = approved_with("transition", &args, &token, &fake);
+    let (error, v) = text(&plugin.call("transition", args, Some(ctx)).await);
+    assert!(!error, "{v}");
+    assert_eq!(v["result"]["final_status"], "UAT");
+    let ids: Vec<&Value> = v["result"]["hops"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| &h["transition"]["id"])
+        .collect();
+    assert_eq!(ids, ["23", "31"]);
+    assert_eq!(fake.writes().len(), 2);
+}

@@ -110,11 +110,21 @@ enum Command {
         #[command(flatten)]
         propose: Propose,
     },
-    /// Propose a transition, by id or name.
+    /// Propose a transition, by id or name; or a route of several, to a
+    /// status (--to) or through named hops (--hop), approved as one change.
     Transition {
         key: String,
-        transition: String,
-        /// A field the transition takes, as id=JSON (or id=text).
+        #[arg(required_unless_present_any = ["to", "hops"], conflicts_with_all = ["to", "hops"])]
+        transition: Option<String>,
+        /// The status to end in, through as many transitions as it takes.
+        #[arg(long, value_name = "STATUS", conflicts_with = "hops")]
+        to: Option<String>,
+        /// A hop to take, in order: a transition id or name, or the status it
+        /// leads to. Repeat for each hop.
+        #[arg(long = "hop", value_name = "HOP")]
+        hops: Vec<String>,
+        /// A field the transition takes, as id=JSON (or id=text). With --to
+        /// or --hop, it goes with the last hop.
         #[arg(long = "field")]
         fields: Vec<String>,
         #[command(flatten)]
@@ -468,10 +478,17 @@ async fn run(cli: Cli) -> Result<(), Fail> {
         Command::Transition {
             key,
             transition,
+            to,
+            hops,
             fields,
             propose: options,
         } => {
-            let mut args = json!({ "key": key, "transition": transition });
+            let mut args = json!({ "key": key });
+            match (transition, to) {
+                (Some(t), _) => args["transition"] = json!(t),
+                (None, Some(to)) => args["to_status"] = json!(to),
+                (None, None) => args["path"] = json!(hops),
+            }
             if !fields.is_empty() {
                 let mut given = Map::new();
                 for f in fields {
