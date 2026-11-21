@@ -5,7 +5,7 @@ Jira from the command line and from agents, where **no write is applied without 
 One binary, three modes:
 
 - **a CLI** for people and scripts. A change file is plain JSON, so it can be reviewed in git like any other diff;
-- **`jira-review mcp`**, an MCP server on stdio for any agent client. Reads answer directly. Writes return a proposal id the agent waits on while a person runs `jira-review review`;
+- **`jira-review mcp`**, an MCP server on stdio for any agent client. Reads answer directly. Writes return a proposal id the agent waits on while a person runs `jira-review review`, in a terminal or on a local page (`--web`);
 - **`jira-review serve`**, the [Tracon](https://github.com/cosmicspork/tracon) plugin contract v1. The node's approval card is the review step.
 
 Other Jira tools apply writes immediately. Atlassian's ACLI is Cloud only, closed source, and cannot list an issue's available transitions. [jira-cli](https://github.com/ankitpokhrel/jira-cli) is interactive. Atlassian's hosted Rovo MCP server and [mcp-atlassian](https://github.com/sooperset/mcp-atlassian) apply whatever the agent asks. jira-review puts a reviewable, stale-checked change between the request and Jira.
@@ -127,6 +127,24 @@ jira-review review --approve <id>
 jira-review review --reject <id> --reason 'not this sprint'
 ```
 
+Or on a page in a browser:
+
+```sh
+jira-review review --web           # prints http://127.0.0.1:<port>/?token=…; --port picks the port
+```
+
+The page lists what is waiting, oldest first, with each change's diff, an **Approve and apply** button, and **Reject** with an optional reason. It decides through the same code as the terminal: the same claim, the same stale check, the same outcome the agent's `proposal_status` reads. Reload it to see proposals that arrived since. It runs until ctrl-c, and `--markdown` shows wiki text as Markdown, as in the terminal.
+
+Only you should be able to approve, so the page is closed to everyone else on the machine and to every website:
+
+- it listens on 127.0.0.1 only;
+- each launch makes a random token that is printed once, in the address to open. Opening it trades the token for a cookie (`HttpOnly`, `SameSite=Strict`, named for the port) and drops the token from the address bar. Every other request needs that cookie;
+- a request whose `Host` is not `127.0.0.1:<port>` or `localhost:<port>` is refused, so a website that rebinds its own name to 127.0.0.1 (DNS rebinding) gets nothing;
+- an approval or rejection is a POST that must carry an `Origin` equal to the page's own and a form field only the page holds. Cookies are not kept apart by port, so a page served from another local port could otherwise send one with yours;
+- the page sends `frame-ancestors 'none'` and `X-Frame-Options: DENY`, so it cannot be framed, and runs no script.
+
+Anyone who can read the printed address, or your browser's cookies, can approve. That is the same person who could run `jira-review review` as you.
+
 Approving applies the change at once with the reviewer's own credential, running the stale check at that moment. Proposals live in `$JIRA_REVIEW_STATE`, else `$XDG_STATE_HOME/jira-review`, else `~/.local/state/jira-review` (`~/Library/Application Support/jira-review` on macOS), as `pending/<id>.json` and then `decided/<id>.json`. Claiming one is an atomic rename, so two reviewers can't both apply it.
 
 ## Tracon plugin (`jira-review serve`)
@@ -231,6 +249,7 @@ jira-review wiki from-markdown notes.md
 - both auth schemes' headers;
 - credential precedence (environment, then `.env`, then keyring);
 - `mcp` over stdio with the proposal flow across processes (approve, reject, stale);
+- the `review --web` page: the token traded for a cookie, a wrong token, cookie, `Host` or `Origin` refused, a decision without the page's form field refused, all with nothing sent; approve, reject with a reason, a stale approval and a second approval of the same proposal;
 - `serve` over a Unix socket with signed contexts, each refusal and an approved write;
 - `tracon/preview`: a write's diff and token with nothing sent, a read's `previewable: false`, a write that would be refused, and a preview whose context does not verify; the approved call applying against the token, and refused as stale (`data.stale`) with nothing sent once the issue moved;
 - `tracon/format/convert` both ways, and its `-32602` refusals;
