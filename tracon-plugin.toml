@@ -1,5 +1,5 @@
 name = "jira-review"
-version = "0.2.1"
+version = "0.3.0"
 contract = 1
 exec = ["bin/jira-review", "serve"]
 # No egress listed: the host is whatever JIRA_URL names (a Jira Cloud site or

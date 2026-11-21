@@ -1,6 +1,6 @@
 [package]
 name = "jira-review"
-version = "0.2.1"
+version = "0.3.0"
 license = "MIT"
 edition = "2024"
 description = "Jira from the command line and from agents, where no write is applied without review"
