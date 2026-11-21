@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.0](https://github.com/cosmicspork/jira-review/compare/v0.2.1...v0.3.0) (2026-11-21)
+
+
+### Features
+
+* approve a multi-hop transition as one change ([#16](https://github.com/cosmicspork/jira-review/issues/16)) ([558922b](https://github.com/cosmicspork/jira-review/commit/558922b33f67bf42ae7f5be13b95dfbe44f031e9))
+* review mcp proposals on a loopback page ([#14](https://github.com/cosmicspork/jira-review/issues/14)) ([dfdf7bf](https://github.com/cosmicspork/jira-review/commit/dfdf7bfa9186744ce71a68a9b4a3a5508e20c643))
+
 ## [0.2.1](https://github.com/cosmicspork/jira-review/compare/v0.2.0...v0.2.1) (2026-11-20)
 
 
