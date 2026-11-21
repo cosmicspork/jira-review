@@ -32,6 +32,81 @@ struct Jira {
     clock: u32,
     next_issue: u32,
     users: Vec<Value>,
+    workflow: Option<Workflow>,
+}
+
+/// A workflow whose transitions lead from named statuses (none for a
+/// global one), so what an issue offers depends on where it is.
+#[derive(Default)]
+struct Workflow {
+    transitions: Vec<Value>,
+    /// The preview answers as Cloud does a caller without permission.
+    hidden: bool,
+    /// Once an issue enters this status, the transition is removed.
+    retire: Option<(String, String)>,
+}
+
+impl Workflow {
+    /// What an issue in `status` is offered, as Jira lists it.
+    fn offered(&self, status: &str) -> Vec<Value> {
+        self.transitions
+            .iter()
+            .filter(|t| {
+                let from = t["from"].as_array().unwrap();
+                if from.is_empty() {
+                    t["to"] != status
+                } else {
+                    from.iter().any(|f| f == status)
+                }
+            })
+            .map(|t| {
+                json!({ "id": t["id"], "name": t["name"], "to": self::status(t["to"].as_str().unwrap()),
+                        "fields": t["fields"] })
+            })
+            .collect()
+    }
+
+    /// The workflow as Cloud's `workflows/preview` shows it.
+    fn preview(&self) -> Value {
+        let mut names: Vec<&str> = vec!["To Do"];
+        for t in &self.transitions {
+            for n in t["from"].as_array().unwrap().iter().chain([&t["to"]]) {
+                let n = n.as_str().unwrap();
+                if !names.contains(&n) {
+                    names.push(n);
+                }
+            }
+        }
+        let reference = |n: &str| status(n)["id"].clone();
+        let mut transitions = vec![json!({ "id": "1", "name": "Create", "type": "INITIAL",
+                                           "toStatusReference": reference("To Do"), "links": [] })];
+        for t in &self.transitions {
+            let from = t["from"].as_array().unwrap();
+            transitions.push(json!({
+                "id": t["id"], "name": t["name"],
+                "type": if from.is_empty() { "GLOBAL" } else { "DIRECTED" },
+                "toStatusReference": reference(t["to"].as_str().unwrap()),
+                "links": from.iter().map(|f| json!({
+                    "fromPort": 0, "toPort": 0,
+                    "fromStatusReference": reference(f.as_str().unwrap()) })).collect::<Vec<_>>(),
+                "actions": [], "validators": [], "triggers": [],
+            }));
+        }
+        json!({
+            "statuses": names.iter().map(|n| {
+                let s = status(n);
+                json!({ "id": s["id"], "name": n, "statusReference": s["id"],
+                        "statusCategory": "IN_PROGRESS", "scope": { "type": "GLOBAL" } })
+            }).collect::<Vec<_>>(),
+            "workflows": [{
+                "id": "b9ff2384", "name": "Strict",
+                "queryContext": [{ "project": "10000", "issueTypes": ["10001"] }],
+                "statuses": names.iter().map(|n| json!({ "statusReference": reference(n) }))
+                    .collect::<Vec<_>>(),
+                "transitions": transitions,
+            }],
+        })
+    }
 }
 
 impl Jira {
@@ -111,7 +186,18 @@ fn status(name: &str) -> Value {
         "Done" => "done",
         _ => "indeterminate",
     };
-    json!({ "name": name, "statusCategory": { "key": key, "name": name } })
+    let id = match name {
+        "To Do" => "10001",
+        "In Progress" => "10002",
+        "Done" => "10003",
+        "Requirements Gathering" => "10004",
+        "UAT" => "10005",
+        "Rollout" => "10006",
+        "Canceled" => "10007",
+        "On-hold" => "10008",
+        _ => "10099",
+    };
+    json!({ "id": id, "name": name, "statusCategory": { "key": key, "name": name } })
 }
 
 fn issue(key: &str, summary: &str, kind: &str, labels: &[&str]) -> Value {
@@ -121,7 +207,8 @@ fn issue(key: &str, summary: &str, kind: &str, labels: &[&str]) -> Value {
             "summary": summary,
             "description": null,
             "status": status("To Do"),
-            "issuetype": { "name": kind },
+            "issuetype": { "id": "10001", "name": kind },
+            "project": { "id": "10000", "key": key.split('-').next().unwrap() },
             "priority": { "name": "Medium" },
             "assignee": null,
             "duedate": null,
@@ -232,6 +319,61 @@ impl Fake {
         self.state.lock().unwrap().touch(key);
     }
 
+    /// Give issues a strict workflow: To Do, Requirements Gathering, In
+    /// Progress, UAT, Rollout, Done, each only from the one before (Done
+    /// requiring a resolution), with Canceled and On-hold from anywhere and
+    /// On-hold back to In Progress.
+    pub fn strict_workflow(&self) {
+        let directed = |id: &str, name: &str, from: &str, to: &str| json!({ "id": id, "name": name, "from": [from], "to": to, "fields": {} });
+        let mut finish = directed("51", "Finish", "Rollout", "Done");
+        finish["fields"] = json!({ "resolution": { "required": true, "name": "Resolution",
+            "allowedValues": [ { "id": "1", "name": "Fixed" } ] } });
+        self.state.lock().unwrap().workflow = Some(Workflow {
+            transitions: vec![
+                directed("11", "Gather", "To Do", "Requirements Gathering"),
+                directed("21", "Start", "Requirements Gathering", "In Progress"),
+                directed("31", "Test", "In Progress", "UAT"),
+                directed("41", "Roll out", "UAT", "Rollout"),
+                finish,
+                directed("81", "Resume", "On-hold", "In Progress"),
+                json!({ "id": "61", "name": "Cancel", "from": [], "to": "Canceled", "fields": {} }),
+                json!({ "id": "71", "name": "Hold", "from": [], "to": "On-hold", "fields": {} }),
+            ],
+            ..Workflow::default()
+        });
+    }
+
+    /// Add a transition to the workflow: `from` statuses (none for a global
+    /// one) to `to`.
+    pub fn add_transition(&self, id: &str, name: &str, from: &[&str], to: &str) {
+        let mut j = self.state.lock().unwrap();
+        j.workflow
+            .as_mut()
+            .unwrap()
+            .transitions
+            .push(json!({ "id": id, "name": name, "from": from, "to": to, "fields": {} }));
+    }
+
+    /// Answer the workflow preview as Cloud does a caller without the
+    /// permission to view it.
+    pub fn hide_workflow(&self) {
+        self.state.lock().unwrap().workflow.as_mut().unwrap().hidden = true;
+    }
+
+    /// Remove transition `id` once an issue enters `status`, as an admin
+    /// editing the workflow mid-route would.
+    pub fn retire_on_entering(&self, status: &str, id: &str) {
+        self.state.lock().unwrap().workflow.as_mut().unwrap().retire =
+            Some((status.to_string(), id.to_string()));
+    }
+
+    /// Put `key` in `status`, as a person moving it on the board would.
+    pub fn set_status(&self, key: &str, name: &str) {
+        let mut j = self.state.lock().unwrap();
+        j.issues.get_mut(key).unwrap()["fields"]["status"] = status(name);
+        j.touch(key);
+    }
+
     /// Refuse the next write with `status` and `body`; queued in order.
     pub fn refuse_next_write(&self, status: u16, body: Value) {
         self.state.lock().unwrap().refuse_write.push((status, body));
@@ -245,17 +387,22 @@ impl Fake {
         self.state.lock().unwrap().requests.clone()
     }
 
-    /// Every request that was not a GET.
+    /// Every request that was not a read.
     pub fn writes(&self) -> Vec<Request> {
         self.requests()
             .into_iter()
-            .filter(|r| r.method != "GET")
+            .filter(|r| !is_read(&r.method, &r.path))
             .collect()
     }
 
     pub fn clear(&self) {
         self.state.lock().unwrap().requests.clear();
     }
+}
+
+/// A GET, or the workflow preview, which reads by POST.
+fn is_read(method: &str, path: &str) -> bool {
+    method == "GET" || path == "/rest/api/3/workflows/preview"
 }
 
 fn answer(status: u16, body: Value) -> Response {
@@ -304,7 +451,7 @@ async fn handle(
     if auth.is_none() {
         return answer(401, json!({ "errorMessages": ["not logged in"] }));
     }
-    if method != Method::GET && !j.refuse_write.is_empty() {
+    if !is_read(method.as_str(), &path) && !j.refuse_write.is_empty() {
         let (status, body) = j.refuse_write.remove(0);
         return answer(status, body);
     }
@@ -406,6 +553,61 @@ async fn handle(
                 .push(comment);
             j.touch(&key);
             answer(201, json!({ "id": "200", "created": created }))
+        }
+        ("POST", ["rest", "api", "3", "workflows", "preview"]) => match &j.workflow {
+            _ if j.data_center => answer(404, json!({ "errorMessages": ["no such endpoint"] })),
+            Some(w) if w.hidden => answer(
+                401,
+                json!({ "errorMessages": ["You don't have permission to view this workflow."] }),
+            ),
+            Some(w) if body["projectId"] == "10000" && body["issueTypeIds"] == json!(["10001"]) => {
+                answer(200, w.preview())
+            }
+            Some(_) => answer(400, json!({ "errorMessages": ["bad preview request"] })),
+            None => answer(404, json!({ "errorMessages": ["fake has no workflow"] })),
+        },
+        ("GET", ["rest", "api", "2", "issue", key, "transitions"]) if j.workflow.is_some() => {
+            let Some(i) = j.issues.get(*key) else {
+                return missing(key);
+            };
+            let here = i["fields"]["status"]["name"].as_str().unwrap();
+            let list = j.workflow.as_ref().unwrap().offered(here);
+            answer(200, json!({ "transitions": list }))
+        }
+        ("POST", ["rest", "api", "2", "issue", key, "transitions"]) if j.workflow.is_some() => {
+            let key = key.to_string();
+            let Some(i) = j.issues.get(&key) else {
+                return missing(&key);
+            };
+            let here = i["fields"]["status"]["name"].as_str().unwrap().to_string();
+            let id = body["transition"]["id"].as_str().unwrap_or_default();
+            let w = j.workflow.as_ref().unwrap();
+            let Some(t) = w.offered(&here).into_iter().find(|t| t["id"] == id) else {
+                return answer(
+                    400,
+                    json!({ "errorMessages": ["It seems that you have tried to perform a workflow operation that is not valid for the current state of this issue."] }),
+                );
+            };
+            let required =
+                t["fields"].as_object().unwrap().iter().find(|(f, d)| {
+                    d["required"] == true && body["fields"].get(f.as_str()).is_none()
+                });
+            if let Some((f, _)) = required {
+                return answer(
+                    400,
+                    json!({ "errorMessages": [], "errors": { f: "required" } }),
+                );
+            }
+            let entered = t["to"]["name"].as_str().unwrap().to_string();
+            j.issues.get_mut(&key).unwrap()["fields"]["status"] = t["to"].clone();
+            j.touch(&key);
+            let w = j.workflow.as_mut().unwrap();
+            if let Some((at, gone)) = w.retire.clone()
+                && at == entered
+            {
+                w.transitions.retain(|t| t["id"] != gone.as_str());
+            }
+            answer(204, Value::Null)
         }
         ("GET", ["rest", "api", "2", "issue", key, "transitions"]) => {
             if !j.issues.contains_key(*key) {

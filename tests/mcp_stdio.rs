@@ -241,3 +241,36 @@ async fn a_rejected_or_stale_proposal_says_so_and_writes_nothing() {
         .await;
     assert_eq!(unknown["error"]["code"], -32602);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_route_is_one_proposal_a_person_approves_once() {
+    let fake = Fake::start().await;
+    fake.strict_workflow();
+    let state = tempfile::tempdir().unwrap();
+    let mut mcp = Mcp::start(&fake, state.path());
+
+    let (error, proposed) = mcp
+        .tool(
+            1,
+            "transition",
+            json!({ "key": "WRK-1", "to_status": "Done",
+                    "fields": { "resolution": { "name": "Fixed" } } }),
+        )
+        .await;
+    assert!(!error, "{proposed}");
+    let diff = proposed["diff"].as_str().unwrap();
+    assert!(
+        diff.contains("  5. Rollout -> Done by 51 (Finish)\n"),
+        "{diff}"
+    );
+    let id = proposed["proposal_id"].as_str().unwrap().to_string();
+    assert!(fake.writes().is_empty());
+
+    let (code, out) = review(&fake, state.path(), &["--approve", &id]).await;
+    assert_eq!(code, 0, "{out}");
+    let (_, status) = mcp.tool(2, "proposal_status", json!({ "id": id })).await;
+    assert_eq!(status["status"], "approved", "{status}");
+    assert_eq!(status["result"]["final_status"], "Done");
+    assert_eq!(status["result"]["hops"].as_array().unwrap().len(), 5);
+    assert_eq!(fake.writes().len(), 5);
+}

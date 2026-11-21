@@ -57,6 +57,8 @@ jira-review update WRK-12 --assignee ada@example.com --due 2026-12-01
 jira-review update WRK-12 --unassign --clear-due
 jira-review transition WRK-12 'In Review'
 jira-review transition WRK-12 Resolve --field 'resolution={"name":"Fixed"}'
+jira-review transition WRK-12 --to Done --field 'resolution={"name":"Fixed"}'   # every hop, one change
+jira-review transition WRK-12 --hop 'Requirements Gathering' --hop 'In Progress' --hop UAT
 jira-review link WRK-1 Blocks WRK-2
 jira-review create --project WRK --type Task --summary 'Write the importer' --parent WRK-10 \
   --assignee me --due 2026-12-15
@@ -91,8 +93,41 @@ jira-review apply 0193…-update-WRK-12.json
 - `args` are the write's arguments. `apply` validates them again and builds the request from them.
 - `versions` lists every existing issue the change depends on, with its `updated` stamp at propose time. `update`, `transition` and `comment` depend on their issue, and `link` depends on both of its issues. `create` depends on nothing, so it cannot go stale. A parent named by key is checked to exist at propose time only, and a `#N` parent is an earlier item of the same change.
 - **The stale rule:** `apply` reads each issue's `updated` and refuses if any differs. Jira has no conditional write, so a change that lands between that check and the write is not caught; the window is one request long.
-- Per kind: `update` shows the seven fields it can write (summary, description, priority, assignee, due date, labels, parent). Label removals are matched to the issue's own spelling, and any the issue doesn't have are listed as `not_on_issue`. `transition` shows the status before and after, with the transition it takes. A name matching no transition or several is refused with the list, and so is a transition whose required fields are missing. `link` shows `from`'s links before and after, in the link type's wording. `create` shows the planned issues (up to 10).
+- Per kind: `update` shows the seven fields it can write (summary, description, priority, assignee, due date, labels, parent). Label removals are matched to the issue's own spelling, and any the issue doesn't have are listed as `not_on_issue`. `transition` shows the status before and after, with the transition it takes. A name matching no transition or several is refused with the list, and so is a transition whose required fields are missing. A [route](#transitions-over-several-hops) shows every hop in order. `link` shows `from`'s links before and after, in the link type's wording. `create` shows the planned issues (up to 10).
 - **Assignee and due date.** `duedate` is `YYYY-MM-DD`, checked to be a real day, or null to clear it. `assignee` names a user the way a person would: an account id, a username, an email, a display name, or `me` for the credential's own user; null unassigns. Propose finds them among the users the issue (for `create`, the project) can be assigned to, with Jira's `user/assignable/search`: by `query`, then by `accountId`, on Cloud, and by `username` on Data Center. An exact match on id, username, email or display name wins; otherwise a search that finds exactly one user takes them, and one that finds none or several is refused with who it found. The change shows the assignee by display name and keeps the account Jira takes (`{"accountId": …}` on Cloud, `{"name": …}` on Data Center) as `assignee_ref`, which is what `apply` sends. `--assignee`, `--unassign`, `--due` and `--clear-due` are the CLI's spellings. `comment` shows the last comment's author and time and the new body.
+
+### Transitions over several hops
+
+A strict workflow (To Do, Requirements Gathering, In Progress, UAT, Rollout, Done, each reachable only from the one before) takes five transitions to close an issue. `transition` takes one of three arguments:
+
+- `transition`: one transition the issue offers now, by id, transition name or the status it leads to;
+- `to_status`: the status to end in, through as many transitions as it takes;
+- `path`: the hops to take in order, each named as `transition` is, or `{ "transition": …, "fields": {…} }` for a hop that takes fields (`--hop` on the CLI, repeated).
+
+Either of the last two is **one change, approved once**, that runs each hop in turn. `fields` given beside `to_status` or `path` go with the last hop (`--field` on the CLI), where a resolution usually is.
+
+**Finding the route.** Jira's REST API lists only the transitions an issue offers from where it is now, and nothing a normal user can read reveals what a later status offers without moving the issue there. So:
+
+- A `to_status` that a transition offered now leads to takes that transition, and needs nothing else. Two offered transitions to it are refused with both.
+- Further away, the route is read from the workflow. Jira Cloud shows a workflow, read only, through `POST /rest/api/3/workflows/preview` to a caller with the *View (read-only) workflow* or *Administer projects* project permission. The route is the shortest one, through directed transitions only, that starts with a transition the issue offers now. Global transitions (Canceled or On-hold from any status) are used only when no directed route exists, because an equally short detour through On-hold is never the route anyone means. No route, or more than one equally short, is refused with the routes listed, so the caller can pick one with `path`.
+- Data Center has no REST read of a workflow's transitions (`GET /rest/api/2/workflow` lists names and step counts, for administrators), and a Cloud credential without the permission is refused it too. There, a `to_status` past the next status is refused with what the issue offers now, and the caller names the hops with `path`. Statuses work as hop names, so `path: ["Requirements Gathering", "In Progress", "UAT", "Rollout", "Done"]` is enough.
+- A `path` is checked hop by hop against the workflow when it can be read. When it can't, its first hop is checked against what the issue offers, and each later hop is resolved only when the issue reaches it. The card says which.
+
+Only the first hop's required fields can be known in advance (Jira lists a transition's fields only once the issue offers it). The card shows them for the first hop and says that later hops' are checked when the issue gets there.
+
+**Applying it.** `apply` checks the issue's `updated` stamp once, as for any change. Then, before each hop, it reads the issue's status and what it offers, and stops without sending that hop if the issue is not where the hop starts, the transition is no longer offered or now leads elsewhere, or its required fields are missing. A hop Jira refuses stops it too. Nothing is rolled back: the hops already sent stay applied and the issue is left where it stopped. The call returns once every hop has been applied or one has stopped it:
+
+```json
+{ "key": "WRK-12", "final_status": "In Progress",
+  "hops": [ { "from": "To Do", "transition": { "id": "11", "name": "Gather" }, "to": "Requirements Gathering", "ok": true },
+            { "from": "Requirements Gathering", "transition": { "id": "21", "name": "Start" }, "to": "In Progress", "ok": true },
+            { "from": "In Progress", "transition": { "id": "31", "name": "Test" }, "to": "UAT", "ok": false,
+              "error": "WRK-12 no longer offers transition 31 (Test) from In Progress; …" } ],
+  "stopped_at": 2,
+  "not_tried": [ { "from": "UAT", "transition": { "id": "41", "name": "Roll out" }, "to": "Rollout" } ] }
+```
+
+`final_status` is read back from Jira after the last hop, so it is the issue's real status. `stopped_at` and `not_tried` appear only when the route stopped part way. A route whose first hop stops moves nothing and is an error, as a refused single transition is.
 
 ## `jira-review mcp`
 
@@ -168,11 +203,11 @@ At start it requires `TRACON_PLUGIN_TOKEN` and `TRACON_NODE_KEY` (and `TRACON_CO
 ```
 
 - `body` is Markdown: the diff `show` prints, without its header, in a code fence longer than any run of backticks inside it;
-- `token` is the proposal's `versions` as canonical JSON. The node keeps it with the approval and hands it back unread;
+- `token` is the proposal's `versions` as canonical JSON. For a route of several hops it is `{"route": […], "versions": {…}}`, the route as each hop's statuses and transition. The node keeps it with the approval and hands it back unread;
 - a read answers `previewable: false` with a `null` token, since there is nothing to show before it runs;
 - a write that would be refused (an unknown transition, a missing issue, a credential not lent) answers JSON-RPC error `-32003` with the reason, and the card shows it.
 
-The approved `tools/call` carries the token back as the context's `preview_token`. The write is applied against it rather than against a fresh read: if an issue it names has moved since the card was shown, nothing is sent, the change is recorded as stale, and the call is refused with JSON-RPC error `-32002` whose `data` is `{"stale": true}`, so the node can ask the agent to call again for a fresh card. An approved call without a token is checked against the issue as it is when the call arrives. Any stale refusal answers the same way.
+The approved `tools/call` carries the token back as the context's `preview_token`. The write is applied against it rather than against a fresh read: if an issue it names has moved since the card was shown, nothing is sent, the change is recorded as stale, and the call is refused with JSON-RPC error `-32002` whose `data` is `{"stale": true}`, so the node can ask the agent to call again for a fresh card. A route is found again when the approved call arrives, and if it is not the route the token names (the workflow changed while the issue did not), nothing is sent and the call is refused the same way. An approved call without a token is checked against the issue as it is when the call arrives. Any stale refusal answers the same way.
 
 **`tracon/format/convert`** takes `{ "format": "jira_wiki", "to": "markdown" | "jira_wiki", "text": "…" }` and answers `{ "text": "…" }`, from wiki markup to Markdown or from Markdown to wiki markup. It is a pure function. Any other `format` or `to`, or a missing `text`, is a `-32602` error.
 
@@ -245,6 +280,7 @@ jira-review wiki from-markdown notes.md
 - each write's propose → show → apply, with the exact requests sent;
 - assignee lookup (by email, name, account id and `me`; an ambiguous or unknown name refused) on both Cloud and Data Center, and due dates set and cleared;
 - a stale apply refused after the fake's `updated` moves, with nothing sent;
+- transitions over several hops on a strict workflow: a route found in the workflow and applied hop by hop, the On-hold detour passed over, no route and an ambiguous route refused with the routes, a `path` checked against the workflow, a `path` without it (Cloud without the permission, and Data Center), a hop retired mid-route and a required field found on the way each stopping the route there, a stale route sending nothing, and a route whose card no longer matches the workflow refused as stale through `serve`;
 - multi-issue create with `#N` parents and a refusal partway through;
 - both auth schemes' headers;
 - credential precedence (environment, then `.env`, then keyring);
@@ -261,6 +297,7 @@ jira-review wiki from-markdown notes.md
 
 - a live Jira Cloud site. `tests/live.rs` is a read-only smoke test, run with `JIRA_LIVE=1 cargo test --test live -- --ignored`;
 - **Jira Data Center (bearer PAT): unverified** on a real instance;
+- the workflow read for routes (`POST /rest/api/3/workflows/preview`) against a real Cloud site: the fake answers in the shape and with the permission refusal (401) the Cloud REST API's OpenAPI description gives, and which permission schemes grant *View (read-only) workflow* by default is not checked;
 - assignee lookup against a real Jira: the fake matches users the way the REST docs describe `user/assignable/search`, and a real site's matching may differ;
 - the keyring backends (`login`, `logout`, keyring reads). Only the secret format is tested;
 - the release workflow, until the first tag, including the aarch64 Linux cross build;

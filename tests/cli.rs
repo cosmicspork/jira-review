@@ -104,3 +104,59 @@ async fn a_stale_change_file_exits_3_and_is_left_as_it_was() {
         before
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_route_is_proposed_by_hops_and_applied_in_order() {
+    let fake = Fake::start().await;
+    fake.strict_workflow();
+    let dir = tempfile::tempdir().unwrap();
+    let (code, out) = run(
+        &fake,
+        dir.path(),
+        &[
+            "transition",
+            "WRK-1",
+            "--hop",
+            "Gather",
+            "--hop",
+            "Start",
+            "--out",
+            "c.json",
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.contains("  2. Requirements Gathering -> In Progress by 21 (Start)"),
+        "{out}"
+    );
+    assert!(fake.writes().is_empty());
+    let (code, out) = run(
+        &fake,
+        dir.path(),
+        &["transition", "WRK-1", "--to", "UAT", "--out", "-"],
+    )
+    .await;
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.contains("  3. In Progress -> UAT by 31 (Test)"),
+        "{out}"
+    );
+    let (code, out) = run(
+        &fake,
+        dir.path(),
+        &["transition", "WRK-1", "Gather", "--to", "UAT"],
+    )
+    .await;
+    assert_ne!(code, 0, "{out}");
+
+    let (code, out) = run(&fake, dir.path(), &["apply", "c.json"]).await;
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("\"final_status\": \"In Progress\""), "{out}");
+    let ids: Vec<Value> = fake
+        .writes()
+        .iter()
+        .map(|w| w.body["transition"]["id"].clone())
+        .collect();
+    assert_eq!(ids, ["11", "21"]);
+}

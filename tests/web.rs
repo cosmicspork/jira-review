@@ -421,3 +421,40 @@ async fn the_page_rejects_and_refuses_what_moved() {
     assert!(html.contains("WRK-1 moved"), "{html}");
     assert!(html.contains("not now"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_page_shows_every_hop_of_a_route_and_applies_them_all() {
+    let fake = Fake::start().await;
+    fake.strict_workflow();
+    let page = Served::start(&fake).await;
+    let id = put(
+        &fake,
+        &page.store,
+        Kind::Transition,
+        json!({ "key": "WRK-1", "to_status": "Done",
+                "fields": { "resolution": { "name": "Fixed" } } }),
+    )
+    .await;
+    let cookie = page.sign_in().await;
+    let (html, csrf) = page.index(&cookie).await;
+    for line in [
+        "<span class=\"del\">- To Do</span><span class=\"ins\">+ Done</span>",
+        "<span class=\"\">  1. To Do -&gt; Requirements Gathering by 11 (Gather)</span>",
+        "<span class=\"\">  5. Rollout -&gt; Done by 51 (Finish)</span>",
+        "<span class=\"ins\">+    resolution: {&quot;name&quot;:&quot;Fixed&quot;}</span>",
+    ] {
+        assert!(html.contains(line), "{line:?} not in\n{html}");
+    }
+    let ok = [
+        ("Host", page.host()),
+        ("Cookie", cookie.clone()),
+        ("Origin", page.origin()),
+    ];
+    let a = page
+        .decide("approve", &id, &ok, &format!("csrf={csrf}"))
+        .await;
+    assert_eq!(a.status, 303, "{}", a.body);
+    assert_eq!(page.status(&id), Some(Status::Approved));
+    assert_eq!(fake.writes().len(), 5);
+    assert_eq!(fake.issue("WRK-1")["fields"]["status"]["name"], "Done");
+}

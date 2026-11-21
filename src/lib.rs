@@ -10,6 +10,7 @@ pub mod contract;
 pub mod jira;
 pub mod mcp;
 pub mod review;
+pub mod route;
 #[cfg(unix)]
 pub mod serve;
 pub mod stdio;

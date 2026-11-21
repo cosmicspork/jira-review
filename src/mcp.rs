@@ -273,17 +273,45 @@ pub fn definitions(profile: bool, write_note: &str) -> Vec<Value> {
         json!({
             "name": "transition",
             "description": format!(
-                "Move an issue through its workflow by a transition it offers now, named by id \
-                 or by name (of the transition or of the status it leads to), as transitions \
-                 lists them. Fields the transition requires go in fields. {write_note}"
+                "Move an issue through its workflow. Give one of: transition, a transition it \
+                 offers now, named by id or by name (of the transition or of the status it \
+                 leads to), as transitions lists them; to_status, the status to end in, \
+                 reached through as many transitions as the workflow needs, one approval for \
+                 all; or path, the hops to take in order, each named as transition is. A \
+                 to_status more than one transition away is routed through the workflow, \
+                 which Jira Cloud shows only with the View (read-only) workflow or Administer \
+                 projects permission and Data Center not at all; without it, or when more \
+                 than one route is as short, it is refused and path is the way. The hops run \
+                 in order, each checked again just before it is sent; the result is \
+                 {{ final_status, hops: [{{ from, transition, to, ok }}], stopped_at, \
+                 not_tried }}, final_status read back from Jira. A hop that cannot be sent stops the \
+                 route there and nothing is undone. Fields a transition requires go in \
+                 fields (with to_status or path, they go with the last hop). {write_note}"
             ),
             "inputSchema": { "type": "object", "properties": {
                 "key": key,
                 "transition": string("Transition id or name, e.g. 31 or In Review."),
+                "to_status": string("The status to end in, e.g. Done."),
+                "path": {
+                    "type": "array",
+                    "description": format!(
+                        "The hops to take in order, at most {}: each a transition id or name \
+                         or the status it leads to, or {{ transition, fields }} for a hop that \
+                         takes fields.",
+                        crate::route::MAX_HOPS
+                    ),
+                    "items": { "anyOf": [
+                        { "type": "string" },
+                        { "type": "object", "properties": {
+                            "transition": { "type": "string" },
+                            "fields": { "type": "object" },
+                        }, "required": ["transition"] },
+                    ] },
+                },
                 "fields": { "type": "object",
                             "description": "Field id to value, as Jira takes it, e.g. \
                                             {\"resolution\": {\"name\": \"Fixed\"}}." },
-            }, "required": ["key", "transition"] },
+            }, "required": ["key"] },
             "annotations": write(true),
         }),
         json!({
@@ -540,6 +568,26 @@ fn lent_jira(
     Ok((args, jira))
 }
 
+/// The version token a preview hands the node: the proposal's `versions`,
+/// and for a route of several hops the route too, so that an approved call
+/// is applied only along the route its card showed.
+pub fn token_of(p: &Proposal) -> String {
+    match crate::route::identity(p) {
+        None => contract::canonical(&json!(p.versions)),
+        Some(route) => contract::canonical(&json!({ "versions": p.versions, "route": route })),
+    }
+}
+
+/// A token [`token_of`] made: the versions and, for a route, the route.
+pub fn read_token(token: &str) -> Option<(Versions, Option<Value>)> {
+    let v: Value = serde_json::from_str(token).ok()?;
+    if v.get("route").is_some() {
+        let versions = serde_json::from_value(v.get("versions")?.clone()).ok()?;
+        return Some((versions, Some(v["route"].clone())));
+    }
+    Some((serde_json::from_value(v).ok()?, None))
+}
+
 /// A proposal as `tracon/preview` answers it: its diff as Markdown, and its
 /// `versions` as the token an approved call hands back.
 pub fn preview_of(p: &Proposal) -> Value {
@@ -550,7 +598,7 @@ pub fn preview_of(p: &Proposal) -> Value {
         "previewable": true,
         "summary": change::title(p),
         "body": format!("{fence}diff\n{diff}{fence}\n"),
-        "token": contract::canonical(&json!(p.versions)),
+        "token": token_of(p),
     })
 }
 
@@ -611,9 +659,9 @@ impl Plugin {
         let Some(kind) = Kind::parse(name) else {
             return Ok(answer(read(name, &args, &jira).await));
         };
-        let expected: Option<Versions> = match &caller.preview_token {
+        let token = match &caller.preview_token {
             None => None,
-            Some(token) => Some(serde_json::from_str(token).map_err(|_| {
+            Some(token) => Some(read_token(token).ok_or_else(|| {
                 RpcError::new(
                     -32602,
                     "preview_token is not a version token from this plugin",
@@ -626,6 +674,25 @@ impl Plugin {
             Ok(p) => p,
             Err(e) => return Ok(tool_error(&e)),
         };
+        let (expected, shown_route) = match token {
+            Some((versions, route)) => (Some(versions), Some(route)),
+            None => (None, None),
+        };
+        // A route found again may differ from the card's when the workflow
+        // changed while the issue did not: that card no longer describes it.
+        if let Some(shown) = shown_route
+            && shown != crate::route::identity(&p)
+        {
+            return Err(RpcError {
+                code: STALE,
+                message: format!(
+                    "the route for {} is not the one its card showed (the workflow or what the \
+                     issue offers changed); call again for a fresh card",
+                    p.subject()
+                ),
+                data: Some(json!({ "stale": true })),
+            });
+        }
         let applied = change::apply(&p, &jira, expected.as_ref()).await;
         p.outcome = Some(Outcome::of(applied.clone()));
         if let Err(e) = self.store.record(&p) {

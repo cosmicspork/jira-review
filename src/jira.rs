@@ -228,6 +228,21 @@ impl Jira {
         ))
     }
 
+    /// The workflow a project uses for an issue type, as Cloud's read-only
+    /// preview shows it: its statuses and the transitions between them. It
+    /// needs the *View (read-only) workflow* or *Administer projects*
+    /// project permission. Data Center has no such read, and answers 404.
+    pub async fn workflow_preview(&self, project: &str, issue_type: &str) -> Result<Value, String> {
+        self.expect(
+            "jira did not show the workflow",
+            Method::POST,
+            "/rest/api/3/workflows/preview",
+            &[],
+            Some(&json!({ "projectId": project, "issueTypeIds": [issue_type] })),
+        )
+        .await
+    }
+
     /// The instance's link types.
     pub async fn link_types(&self) -> Result<Vec<LinkType>, String> {
         let v = self
