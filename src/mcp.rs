@@ -355,7 +355,7 @@ pub fn definitions(profile: bool, write_note: &str) -> Vec<Value> {
     if profile {
         for tool in &mut tools {
             tool["inputSchema"]["properties"]["profile"] =
-                string("Which lent Jira credential to use: none for jira, P for jira-P.");
+                string("Which Jira credential the call is lent: jira-P for P, jira when left out.");
         }
     }
     tools
@@ -547,6 +547,10 @@ fn now_ms() -> i64 {
 
 /// The Jira a call's `profile` picks among the credentials lent to it, and
 /// its arguments without `profile`.
+///
+/// The manifest's `select = "profile"` has the node lend only the binding
+/// this names, so the two must read `profile` alike: absent, `null` or `""`
+/// is `jira`, any other string `jira-<profile>`, untrimmed.
 fn lent_jira(
     args: &Value,
     lent: &HashMap<String, HashMap<String, String>>,
@@ -554,8 +558,9 @@ fn lent_jira(
     let mut args = args.clone();
     let profile = match args.as_object_mut().and_then(|o| o.remove("profile")) {
         None | Some(Value::Null) => None,
-        Some(Value::String(p)) if !p.trim().is_empty() => Some(p.trim().to_string()),
-        Some(_) => return Err("profile expects a non-empty string".into()),
+        Some(Value::String(p)) if p.is_empty() => None,
+        Some(Value::String(p)) => Some(p),
+        Some(_) => return Err("profile expects a string".into()),
     };
     let wanted = auth::lent_name(profile.as_deref());
     let fields = lent

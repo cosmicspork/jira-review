@@ -8,12 +8,16 @@ exec = ["bin/jira-review", "serve"]
 # Jira wiki markup, converted to and from Markdown by tracon/format/convert.
 formats = ["jira_wiki"]
 
-# Lent per call as `jira`, or `jira-<profile>` for a tool call's `profile`.
+# Each call is lent one binding, the one its `profile` argument names:
+# `jira-<profile>`, or `jira` when the call leaves it out (or passes null or
+# ""). A profile naming a binding the channel does not bind is refused by the
+# node before the call is sent. Nodes before 0.58 refuse `select`.
 # Fields: JIRA_URL with JIRA_EMAIL and JIRA_TOKEN (Cloud), or JIRA_PAT (Data
 # Center). The same credential serves reads and approved writes.
 [[credential]]
 name = "jira"
 pattern = "jira-*"
+select = "profile"
 
 [[tool]]
 name = "search"

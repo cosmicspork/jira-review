@@ -186,7 +186,7 @@ Approving applies the change at once with the reviewer's own credential, running
 
 `jira-review serve --socket <path> --data <dir>` implements the Tracon plugin contract v1: MCP over HTTP on the Unix socket the node names (POST answers with JSON, GET gets 405). The manifest is [`tracon-plugin.toml`](tracon-plugin.toml):
 
-- credential `jira`, pattern `jira-*`. A tool's optional `profile` argument picks `jira-<profile>` instead of `jira`. Credentials are lent per call in the caller context, never read from the start environment, so a credential missing from a call means the call can't use it;
+- credential `jira`, pattern `jira-*`, with `select = "profile"`: every tool takes an optional `profile` argument, and the node lends a call only the binding it names, `jira-<profile>`, or `jira` when the call leaves it out (or passes `null` or `""`). A call never carries another profile's credential, and one whose `profile` names a binding the channel does not bind is refused by the node before it is sent. A write's approved call is the agent's call itself, with the arguments its card showed, so it is lent the profile the card named, not a proposal looked up later. A call with no profile on a channel that binds no `jira` is lent nothing and answers `credential jira was not lent to this call`. Credentials are lent per call in the caller context, never read from the start environment. Nodes before Tracon 0.58 refuse the `select` key, so this manifest needs 0.58 or later;
 - tools `search`, `issue`, `transitions` (read) and `update`, `transition`, `link`, `create`, `comment` (write; `transition` is `consequential`);
 - no `egress`: the host is whatever `JIRA_URL` names, a Jira Cloud site or a Data Center host, so no fixed entry would be true. The node shows egress on cards and does not enforce it;
 - `formats = ["jira_wiki"]`: it owns the [`jira_wiki` format](#the-jira_wiki-format). In `tools/list` (from `mcp` too), the string properties that hold wiki markup carry `"x-tracon-format": "jira_wiki"`: `update.description`, `create.description`, `description` inside `create`'s `issues` items, and `comment.body`. The node's approval card shows them as prose, rendered through `tracon/format/convert`, and lists `create`'s `issues` as items.
@@ -287,6 +287,7 @@ jira-review wiki from-markdown notes.md
 - `mcp` over stdio with the proposal flow across processes (approve, reject, stale);
 - the `review --web` page: the token traded for a cookie, a wrong token, cookie, `Host` or `Origin` refused, a decision without the page's form field refused, all with nothing sent; approve, reject with a reason, a stale approval and a second approval of the same proposal;
 - `serve` over a Unix socket with signed contexts, each refusal and an approved write;
+- a call's `profile` read as the manifest's `select` reads it: absent, `null` or `""` uses `jira`, and every tool takes `profile`;
 - `tracon/preview`: a write's diff and token with nothing sent, a read's `previewable: false`, a write that would be refused, and a preview whose context does not verify; the approved call applying against the token, and refused as stale (`data.stale`) with nothing sent once the issue moved;
 - `tracon/format/convert` both ways, and its `-32602` refusals;
 - the `x-tracon-format` markers in `tools/list`, from `serve` and `mcp`;
