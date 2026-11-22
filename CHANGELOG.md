@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.0](https://github.com/cosmicspork/jira-review/compare/v0.2.1...v0.3.0) (2026-11-22)
+
+
+### Features
+
+* approve a multi-hop transition as one change ([#16](https://github.com/cosmicspork/jira-review/issues/16)) ([558922b](https://github.com/cosmicspork/jira-review/commit/558922b33f67bf42ae7f5be13b95dfbe44f031e9))
+* lend each call only the jira binding its profile names ([#17](https://github.com/cosmicspork/jira-review/issues/17)) ([5da9ebb](https://github.com/cosmicspork/jira-review/commit/5da9ebb5dce9b3287a5d25471cb1da136d28f6b5))
+* review mcp proposals on a loopback page ([#14](https://github.com/cosmicspork/jira-review/issues/14)) ([dfdf7bf](https://github.com/cosmicspork/jira-review/commit/dfdf7bfa9186744ce71a68a9b4a3a5508e20c643))
+
 ## [0.2.1](https://github.com/cosmicspork/jira-review/compare/v0.2.0...v0.2.1) (2026-11-20)
 
 
