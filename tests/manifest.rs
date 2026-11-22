@@ -60,8 +60,35 @@ fn the_manifest_is_contract_1_and_versioned_with_the_crate() {
     assert_eq!(credential["name"].as_str(), Some("jira"));
     assert_eq!(credential["pattern"].as_str(), Some("jira-*"));
     assert!(credential.get("lend").is_none());
+    assert_eq!(credential["select"].as_str(), Some("profile"));
     assert_eq!(
         m["formats"].as_array().unwrap(),
         &[toml::Value::from("jira_wiki")]
     );
+}
+
+/// `select = "profile"` lends a call only the binding its `profile` names, so
+/// every tool must take `profile` by that name, or its calls would only ever
+/// be lent `jira`.
+#[test]
+fn every_tool_takes_the_argument_the_credential_selects_by() {
+    let m = manifest();
+    let select = m["credential"].as_array().unwrap()[0]["select"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for tool in mcp::definitions(true, "") {
+        let schema = &tool["inputSchema"];
+        assert_eq!(
+            schema["properties"][&select]["type"], "string",
+            "{} takes no {select}",
+            tool["name"]
+        );
+        let required = schema["required"].as_array().cloned().unwrap_or_default();
+        assert!(
+            !required.contains(&select.clone().into()),
+            "{}",
+            tool["name"]
+        );
+    }
 }

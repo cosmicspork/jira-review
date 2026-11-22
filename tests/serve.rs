@@ -248,6 +248,47 @@ async fn a_read_uses_the_credential_lent_for_its_profile() {
     assert_eq!(fake.requests().len(), 1);
 }
 
+/// The manifest's `select = "profile"` has the node lend `jira` itself when
+/// a call's `profile` is absent, `null` or `""`; the plugin must pick the
+/// same binding, and refuse a profile that is not a string.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_without_a_profile_uses_jira_as_select_lends_it() {
+    let fake = Fake::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut plugin = Plugin::start(dir.path()).await;
+    let bare = json!({ "jira": { "JIRA_URL": fake.url, "JIRA_PAT": "bare-pat" } });
+    for args in [
+        json!({ "key": "WRK-1" }),
+        json!({ "key": "WRK-1", "profile": null }),
+        json!({ "key": "WRK-1", "profile": "" }),
+    ] {
+        let ctx = signed("issue", &args, None, bare.clone());
+        let (error, v) = text(&plugin.call("issue", args.clone(), Some(ctx)).await);
+        assert!(!error, "{args}: {v}");
+        assert_eq!(v["key"], "WRK-1");
+    }
+    let sent = fake.requests();
+    assert_eq!(sent.len(), 3);
+    assert!(
+        sent.iter()
+            .all(|r| r.auth.as_deref() == Some("Bearer bare-pat"))
+    );
+
+    // On a channel that binds no `jira`, select lends such a call nothing.
+    let args = json!({ "key": "WRK-1", "profile": "" });
+    let ctx = signed("issue", &args, None, json!({}));
+    let (error, v) = text(&plugin.call("issue", args, Some(ctx)).await);
+    assert!(error);
+    assert_eq!(v, "credential jira was not lent to this call");
+
+    let args = json!({ "key": "WRK-1", "profile": 7 });
+    let ctx = signed("issue", &args, None, bare);
+    let (error, v) = text(&plugin.call("issue", args, Some(ctx)).await);
+    assert!(error);
+    assert_eq!(v, "profile expects a string");
+    assert_eq!(fake.requests().len(), 3);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_write_applies_only_with_an_approval() {
     let fake = Fake::start().await;
