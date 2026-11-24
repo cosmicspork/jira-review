@@ -141,7 +141,7 @@ It serves `search`, `issue` and `transitions`, which answer at once. `update`, `
 
 `update`, `create` and `comment` take an optional `format`: `jira_wiki` (the default) or `markdown`. Markdown text (a `description`, on each of `issues` too, or a comment's `body`) is converted to wiki markup before proposing, so the proposal holds and shows what will be sent, as the CLI's `--markdown` does. `serve` takes the same argument.
 
-`search` pages when it is given `page: true` or a `cursor`, and `limit` may then go to 100 (100 unless you say). A page answers in the shape Tracon's `GET /api/jira/search` returns, so the node can pass it through unchanged:
+`search` pages when it is given `page: true` or a `cursor`, and `limit` may then go to 100 (100 unless you say). A page answers in this shape, which Workboard reads as its Jira snapshot:
 
 ```json
 { "site": "https://example.atlassian.net", "account_email": "me@example.com",
@@ -213,7 +213,7 @@ The approved `tools/call` carries the token back as the context's `preview_token
 
 `jira-review mcp` answers both methods with `-32601` (method not found).
 
-### Caller context: wire format v1 (provisional, shared with sql-review and Tracon U3)
+### Caller context: wire format v1 (provisional, shared with sql-review and Tracon's plugin host)
 
 On each `tools/call`, `params._meta.tracon` is:
 
@@ -249,7 +249,7 @@ On each `tools/call`, `params._meta.tracon` is:
 - `preview_token` is optional; absent and `null` mean the same. It is present only on a call dispatched from an approved card whose preview returned a token, and is signed like the rest, so no check changes for it.
 - `caller.kind = "plugin"` is reserved: it is accepted, but nothing sends it yet.
 
-[`tests/contract_vectors.json`](tests/contract_vectors.json) pins every byte: a fixed key, token and clock, a valid call with its signing bytes and signature, the same call's context carrying a `preview_token` (`valid_preview_token`), and one tampered case per check. Its `seed` is the **raw ed25519 secret key** (`SigningKey::from_bytes`), *not* a Tracon `Identity` seed, which derives its key through HKDF. sql-review should copy the file into its tests, and Tracon's plugin host should check its signer against it. `cargo test --test contract -- --ignored generate_contract_vectors` regenerates it deterministically.
+[`tests/contract_vectors.json`](tests/contract_vectors.json) pins every byte: a fixed key, token and clock, a valid call with its signing bytes and signature, the same call's context carrying a `preview_token` (`valid_preview_token`), and one tampered case per check. Its `seed` is the **raw ed25519 secret key** (`SigningKey::from_bytes`), *not* a Tracon `Identity` seed, which derives its key through HKDF. sql-review carries a copy in its tests, and Tracon's plugin host checks its signer against it. `cargo test --test contract -- --ignored generate_contract_vectors` regenerates it deterministically.
 
 ## The `jira_wiki` format
 
@@ -301,9 +301,7 @@ jira-review wiki from-markdown notes.md
 - the workflow read for routes (`POST /rest/api/3/workflows/preview`) against a real Cloud site: the fake answers in the shape and with the permission refusal (401) the Cloud REST API's OpenAPI description gives, and which permission schemes grant *View (read-only) workflow* by default is not checked;
 - assignee lookup against a real Jira: the fake matches users the way the REST docs describe `user/assignable/search`, and a real site's matching may differ;
 - the keyring backends (`login`, `logout`, keyring reads). Only the secret format is tested;
-- the release workflow, until the first tag, including the aarch64 Linux cross build;
-- the caller-context format, which stays provisional until Tracon's plugin host (U3) signs against the vectors;
-- `tracon/preview`, `preview_token` and `tracon/format/convert` against a real node, until Tracon's U6 and U8 send them.
+- `tracon/preview`, `preview_token` and `tracon/format/convert` end to end against a real node. The node sends all three, and both sides are tested against the shared vectors, but no test here runs a node.
 
 ## Development
 
